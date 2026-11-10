@@ -28,7 +28,7 @@ import ephem
 
 try:
     from PySide6.QtCore import QEasingCurve, QEvent, QObject, QPropertyAnimation, QSettings, QThread, QTimer, QUrl, Qt, Signal, Slot
-    from PySide6.QtGui import QAction, QColor, QFont, QIcon, QPalette, QPainter, QPen
+    from PySide6.QtGui import QAction, QColor, QFont, QIcon, QPalette, QPainter, QPen, QPixmap
     from PySide6.QtWidgets import (
         QButtonGroup, QCheckBox, QComboBox, QDoubleSpinBox, QFileDialog,
         QFormLayout, QGroupBox, QHBoxLayout, QLabel, QLineEdit, QMainWindow,
@@ -274,15 +274,13 @@ class GatewayScopeTabs(QTabBar):
 
 def _gateway_scope_row(combo):
     row=QWidget();layout=QHBoxLayout(row);layout.setContentsMargins(0,0,0,2)
-    title=QLabel("信关站");title.setStyleSheet("font-weight:700;color:#74e9ff")
-    layout.addWidget(title);layout.addWidget(combo,1)
+    layout.addWidget(combo,1)
     return row
 
 
 def _rain_scope_row(selector):
     row=QWidget();layout=QHBoxLayout(row);layout.setContentsMargins(0,0,0,2)
-    title=QLabel("雨衰工况");title.setStyleSheet("font-weight:700;color:#74e9ff")
-    layout.addWidget(title);layout.addWidget(selector,1)
+    layout.addWidget(selector,1)
     return row
 
 
@@ -393,11 +391,18 @@ class PlanningResultsWidget(QWidget):
         self.rain_scope.currentChanged.connect(lambda _index:self._render_offline_catalog())
         self.summary=QLabel("慢环规划将在开始仿真后生成");self.summary.setObjectName("planningKpi");self.summary.setWordWrap(True)
         self.plans=QTableWidget(0,11);self.plans.setHorizontalHeaderLabels(["生效时段","雨衰工况","使用信关站","馈电链路","链路总容量 Gb/s","落地需求 Gb/s","规划可落地 Gb/s","规划满足率","平均时延 ms","P95时延 ms","校核结果"])
-        self.plan_links=QTableWidget(0,8);self.plan_links.setHorizontalHeaderLabels(["信关站","规划馈电卫星","规划仰角","规划采用雨衰 dB","Es/N0 dB","调制编码","规划容量 Gb/s","雨衰等级"])
+        self.plan_links=QTableWidget(0,9);self.plan_links.setHorizontalHeaderLabels(["信关站","馈电卫星","最低仰角 °","雨衰 dB","Es/N0 dB","调制编码","容量 Gb/s","雨衰等级","卫星 TLE"])
         self.plan_routes=QTableWidget(0,6);self.plan_routes.setHorizontalHeaderLabels(["业务卫星","规划馈电卫星","ISL跳数","路径距离 km","业务 Gb/s","传播时延 ms"])
         for table in (self.plans,self.plan_links,self.plan_routes):
             self._style_table(table)
+        link_header=self.plan_links.horizontalHeader();link_header.setStretchLastSection(False)
+        for column in range(7):link_header.setSectionResizeMode(column,QHeaderView.ResizeMode.Stretch)
+        link_header.setSectionResizeMode(7,QHeaderView.ResizeMode.Fixed);self.plan_links.setColumnWidth(7,96)
+        link_header.setSectionResizeMode(8,QHeaderView.ResizeMode.Fixed);self.plan_links.setColumnWidth(8,100)
+        self.plan_links.horizontalHeaderItem(2).setToolTip("该五分钟规划时段内，6个采样点的最低仰角")
+        self.plan_links.horizontalHeaderItem(3).setToolTip("规划计算采用的雨衰值，单位 dB")
         self.plans.cellClicked.connect(lambda row,_column:self._show_offline_plan_links(row))
+        self.plan_links.cellClicked.connect(self._show_tle_cell)
         self.slow_title=QLabel("慢周期站星规划");self.slow_title.setStyleSheet("font-size:14px;font-weight:700;color:#63e8ff")
         self.plans_label=QLabel("规划批次");self.links_label=QLabel("规划馈电链路");self.routes_label=QLabel("逐跳路径用于内部可达性校核；请在地图点击卫星按需查看")
         layout.addWidget(_gateway_scope_row(self.gateway_scope));layout.addWidget(_rain_scope_row(self.rain_scope))
@@ -405,11 +410,16 @@ class PlanningResultsWidget(QWidget):
         batch_page=QWidget();batch_layout=QVBoxLayout(batch_page);batch_layout.setContentsMargins(8,8,8,8);batch_layout.setSpacing(7)
         batch_layout.addWidget(self.slow_title);batch_layout.addWidget(self.summary);batch_layout.addWidget(self.plans_label);batch_layout.addWidget(_table_export_bar(self,self.plans,"规划批次"));batch_layout.addWidget(self.plans,1)
         link_page=QWidget();link_layout=QVBoxLayout(link_page);link_layout.setContentsMargins(8,8,8,8);link_layout.setSpacing(7)
+        self.time_scope=GatewayScopeTabs()
+        for minute in range(0,30,5):self.time_scope.addItem(f"{minute:02d}:00",minute*60)
+        self.time_scope.currentChanged.connect(lambda _index:self._time_scope_changed())
+        link_layout.addWidget(self.time_scope)
         link_layout.addWidget(self.links_label);link_layout.addWidget(_table_export_bar(self,self.plan_links,"规划馈电链路"));link_layout.addWidget(self.plan_links,1);link_layout.addWidget(self.routes_label)
         self.result_tabs.addTab(batch_page,"规划批次");self.result_tabs.addTab(link_page,"馈电链路")
         layout.addWidget(self.result_tabs,1)
         self.slow_widgets=(self.slow_title,self.summary,self.plans_label,self.plans,self.links_label,self.plan_links,self.routes_label)
         self.plan_routes.hide()
+        self.time_scope.hide()
         for widget in self.slow_widgets:widget.hide()
     @staticmethod
     def _style_table(table):
@@ -453,15 +463,22 @@ class PlanningResultsWidget(QWidget):
                 usage="；".join(f"{_gateway_name(event_names,int(x['gateway']))} {x['used']}/{x['available']}" for x in eplan.get("station_usage",[]) if gid is None or int(x.get("gateway",-1))==gid)
                 delivered=sum(float(r.get('demand_gbps',0)) for r in em['plan_routes']);demand=float(eplan.get('total_demand_gbps',0));ratio=100*delivered/max(demand,1e-12)
                 self._fill(self.plans,self.plans.rowCount(),[f"t={event['time_s']:.2f}s",f"第{ep.get('generation',0)}次",eplan.get("gateway_count",0),len(em["planned"]),f"{em['ideal']:.3f}",f"{demand:.3f}",f"{delivered:.3f}",f"{ratio:.1f}%",f"{em['planned_average_delay_ms']:.3f}",f"{em['planned_p95_delay_ms']:.3f}","执行中"])
-        self.plan_links.setRowCount(0)
-        for i,x in enumerate(metrics["planned"]):
-            gid=int(x.get("gateway",0));name=station_names[gid] if gid<len(station_names) else f"GW-{gid+1:02d}"
-            self._fill(self.plan_links,i,[name,f"SAT-{int(x.get('satellite',0))+1:05d}",f"{x.get('elevation_deg',0):.2f}°",f"{x.get('rain_attenuation_db',0):.2f}",f"{x.get('snr_db',0):.2f}",x.get("modcod","--"),f"{x.get('rate_gbps',0):.3f}",_rain_severity_text(x.get("rain_severity","--"))])
+        if not self.offline_catalog:
+            self.plan_links.setRowCount(0)
+            for i,x in enumerate(metrics["planned"]):
+                gid=int(x.get("gateway",0));name=station_names[gid] if gid<len(station_names) else f"GW-{gid+1:02d}"
+                self._fill(self.plan_links,i,[name,f"SAT-{int(x.get('satellite',0))+1:05d}",f"{x.get('elevation_deg',0):.2f}°",f"{x.get('rain_attenuation_db',0):.2f}",f"{x.get('snr_db',0):.2f}",x.get("modcod","--"),f"{x.get('rate_gbps',0):.3f}",_rain_severity_text(x.get("rain_severity","--"))])
         self._render_deployment()
     def set_gateway_deployment(self,result):
         self.deployment_result=result or {};self._render_deployment()
+    def _show_tle_cell(self,row,column):
+        if column!=8:return
+        item=self.plan_links.item(row,column)
+        tle=item.data(Qt.ItemDataRole.UserRole) if item else None
+        if tle:QMessageBox.information(self,"卫星 TLE",f"{tle['name']}\n{tle['line1']}\n{tle['line2']}")
     def set_offline_catalog(self,catalog):
         self.offline_catalog=list(catalog or []);self.selected_offline_index=None;self._render_offline_catalog()
+        self.time_scope.setVisible(bool(self.offline_catalog))
         total_ms=float(self.offline_catalog[0].get("batch_total_calculation_ms",0)) if self.offline_catalog else 0
         source="基础数据缓存复用" if self.offline_catalog and self.offline_catalog[0].get("planning_cache_reused") else "本次重新计算"
         average_ms=sum(float(row.get("calculation_ms",0)) for row in self.offline_catalog)/max(1,len(self.offline_catalog))
@@ -484,14 +501,25 @@ class PlanningResultsWidget(QWidget):
                 f"{100*float(plan.get('planned_delivery_ratio',0)):.1f}%",f"{float(plan.get('business_propagation_delay_ms',0)):.3f}",f"{float(plan.get('p95_propagation_delay_ms',0)):.3f}",
                 ("起点达99%（已筛全段可见）" if plan.get("delivery_target_satisfied") and plan.get("full_window_visibility_required") else ("达到99%目标" if plan.get("delivery_target_satisfied") else f"缺口 {float(plan.get('delivery_gap_gbps',0)):.3f} Gb/s"))])
         if self.offline_visible_indices:
-            selected=self.selected_offline_index if self.selected_offline_index in self.offline_visible_indices else self.offline_visible_indices[0]
+            selected=self.selected_offline_index if self.selected_offline_index in self.offline_visible_indices else next((index for index in self.offline_visible_indices if int(float(self.offline_catalog[index].get("valid_from_s",-1)))==self.time_scope.currentData()),self.offline_visible_indices[0])
             row=self.offline_visible_indices.index(selected);self.plans.selectRow(row);self._show_offline_plan_links(row)
     def _show_offline_plan_links(self,row):
         if not (0<=int(row)<len(self.offline_visible_indices)):return
         self._show_offline_plan_index(self.offline_visible_indices[int(row)])
+    def _time_scope_changed(self):
+        if not self.offline_catalog:return
+        time_s=self.time_scope.currentData();grade=self.rain_scope.currentData()
+        index=next((i for i,plan in enumerate(self.offline_catalog)
+                    if int(float(plan.get("valid_from_s",-1)))==time_s and (grade is None or plan.get("rain_grade")==grade)),None)
+        if index is not None:
+            if index in self.offline_visible_indices:self.plans.selectRow(self.offline_visible_indices.index(index))
+            self._show_offline_plan_index(index)
     def _show_offline_plan_index(self,index):
         if not (0<=int(index)<len(self.offline_catalog)):return
         self.selected_offline_index=int(index);plan=self.offline_catalog[self.selected_offline_index];self.plan_links.setRowCount(0)
+        time_index=self.time_scope.findData(int(float(plan.get("valid_from_s",0))))
+        if time_index>=0:
+            self.time_scope.blockSignals(True);self.time_scope.setCurrentIndex(time_index);self.time_scope.blockSignals(False)
         gateway_filter=self.gateway_scope.currentData()
         links=[link for link in plan.get("links",[]) if gateway_filter is None or int(link.get("gateway",-1))==gateway_filter]
         links.sort(key=lambda link:(int(link.get("gateway",-1)),int(link.get("satellite",-1))))
@@ -499,7 +527,8 @@ class PlanningResultsWidget(QWidget):
             gateway=int(link.get("gateway",0));name=self.station_names[gateway] if gateway<len(self.station_names) else f"GW-{gateway+1:02d}"
             self._fill(self.plan_links,row,[name,f"SAT-{int(link.get('satellite',0))+1:05d}",f"{float(link.get('elevation_deg',0)):.2f}°",
                 f"{float(link.get('rain_attenuation_db',0)):.2f}",f"{float(link.get('snr_db',0)):.2f}",link.get("modcod","--"),
-                f"{float(link.get('rate_gbps',0)):.3f}",_rain_severity_text(link.get("rain_severity",plan.get("rain_grade","--")))])
+                f"{float(link.get('rate_gbps',0)):.3f}",_rain_severity_text(link.get("rain_severity",plan.get("rain_grade","--"))),"查看 TLE" if link.get("tle") else "—"])
+            self.plan_links.item(row,8).setData(Qt.ItemDataRole.UserRole,link.get("tle"))
         scope="全网" if gateway_filter is None else _gateway_name(self.station_names,gateway_filter)
         self.links_label.setText(f"规划馈电链路 · {int(float(plan.get('valid_from_s',0))//60):02d}:00 · {plan.get('rain_grade','--')} · {scope} · {len(links)} 条")
         if plan.get("selection_strategy")=="window_margin":
@@ -509,6 +538,7 @@ class PlanningResultsWidget(QWidget):
         pass  # Deployment data remains available to the backend; its page was removed.
     def clear(self):
         for table in (self.plans,self.plan_links,self.plan_routes):table.setRowCount(0)
+        self.time_scope.hide()
         self.summary.setText("慢环规划将在开始仿真后生成")
         self.latest_data=None;self.plan_history=[];self.offline_catalog=[];self.offline_visible_indices=[];self.selected_offline_index=None
         for widget in self.slow_widgets:widget.hide()
@@ -529,7 +559,7 @@ class PlanningResourceWidget(QWidget):
         for table in (self.history,self.deployment,self.links,self.routes):PlanningResultsWidget._style_table(table)
         self.execution_tabs=QTabWidget();self.execution_tabs.setDocumentMode(True);self.execution_tabs.setObjectName("planningResultTabs")
         for title,table in (("执行时序",self.history),("信关站资源",self.deployment),("馈电链路",self.links)):
-            page=QWidget();page_layout=QVBoxLayout(page);page_layout.setContentsMargins(8,8,8,8);page_layout.setSpacing(6);page_layout.addWidget(_table_export_bar(self,table,title));page_layout.addWidget(table,1);self.execution_tabs.addTab(page,title)
+            page=QWidget();page_layout=QVBoxLayout(page);page_layout.setContentsMargins(8,8,8,8);page_layout.setSpacing(6);page_layout.addWidget(table,1);self.execution_tabs.addTab(page,title)
         layout.addWidget(self.execution_tabs,1)
         path_note=QLabel("ISL路径用于内部可达性与业务交付校核；在地图点击卫星可查看对应路径。")
         path_note.setStyleSheet("color:#8fb8c8;background:#081d2a;border-left:3px solid #28dfff;padding:7px 9px");layout.addWidget(path_note)
@@ -593,10 +623,20 @@ class PlanningEvaluationWidget(QWidget):
         self.summary=QLabel("等待效果评价");self.summary.setObjectName("planningKpi");self.summary.setWordWrap(True);layout.addWidget(self.summary)
         layout.addWidget(_gateway_scope_row(self.gateway_scope))
         self.result_splitter=QSplitter(Qt.Orientation.Vertical);self.result_splitter.setObjectName("planningResultSplitter")
-        chart_page=QWidget();chart_layout=QVBoxLayout(chart_page);chart_layout.setContentsMargins(0,0,0,0);business_page=QGroupBox("业务送达与容量（Gb/s）");business_layout=QVBoxLayout(business_page);self.chart=ResultTrendChart("business");business_layout.addWidget(self.chart,1);delay_page=QGroupBox("传播时延（ms）");delay_layout=QVBoxLayout(delay_page);self.delay_chart=ResultTrendChart("delay");delay_layout.addWidget(self.delay_chart,1);chart_layout.addWidget(business_page,1);chart_layout.addWidget(delay_page,1)
+        chart_page=QWidget();chart_layout=QVBoxLayout(chart_page);chart_layout.setContentsMargins(0,0,0,0)
+        self.business_page=QGroupBox("业务送达与容量（Gb/s）");business_layout=QVBoxLayout(self.business_page);self.chart=ResultTrendChart("business");business_layout.addWidget(self.chart,1)
+        self.delay_page=QGroupBox("传播时延（ms）");delay_layout=QVBoxLayout(self.delay_page);self.delay_chart=ResultTrendChart("delay");delay_layout.addWidget(self.delay_chart,1)
+        chart_layout.addWidget(self.business_page,1);chart_layout.addWidget(self.delay_page,1)
         event_page=QGroupBox("关键变化与影响");event_layout=QVBoxLayout(event_page);event_layout.setContentsMargins(8,8,8,8)
-        self.events=QTableWidget(0,6);self.events.setHorizontalHeaderLabels(["时刻","影响来源","输入状态","规划/调度响应","结果影响","结论"]);PlanningResultsWidget._style_table(self.events);event_layout.addWidget(_table_export_bar(self,self.events,"效能评估事件"));event_layout.addWidget(self.events,1)
+        self.events=QTableWidget(0,6);self.events.setHorizontalHeaderLabels(["时刻","影响来源","输入状态","规划/调度响应","结果影响","结论"]);PlanningResultsWidget._style_table(self.events);event_layout.addWidget(self.events,1)
         self.result_splitter.addWidget(chart_page);self.result_splitter.addWidget(event_page);self.result_splitter.setStretchFactor(0,3);self.result_splitter.setStretchFactor(1,2);self.result_splitter.setSizes([520,280]);layout.addWidget(self.result_splitter,1)
+    def save_charts_image(self,path):
+        self.chart.hover_index=None;self.delay_chart.hover_index=None
+        images=[self.business_page.grab(),self.delay_page.grab()]
+        combined=QPixmap(max(image.width() for image in images),sum(image.height() for image in images)+8)
+        combined.fill(QColor("#071825"));painter=QPainter(combined)
+        painter.drawPixmap(0,0,images[0]);painter.drawPixmap(0,images[0].height()+8,images[1]);painter.end()
+        return combined.save(str(path),"PNG")
     def update_frame(self,data,_station_names):
         self.latest_data=data;self.station_names=list(_station_names);_sync_gateway_scope(self.gateway_scope,self.station_names)
         added=not self.frame_history or self.frame_history[-1].get("index")!=data.get("index")
@@ -734,7 +774,7 @@ def greenwich_sidereal_angle(utc_time: datetime) -> float:
     return math.radians(degrees%360.0)
 
 
-def read_tle_file(path: Path):
+def read_tle_records(path: Path):
     lines = [line.rstrip() for line in path.read_text(encoding="utf-8").splitlines() if line.strip()]
     header_planes = header_per_plane = None
     if lines and len(lines[0].split()) == 2 and all(x.isdigit() for x in lines[0].split()):
@@ -750,9 +790,31 @@ def read_tle_file(path: Path):
         blocks.append((name, line1, line2))
     if not blocks:
         raise ValueError("TLE文件中没有卫星")
+    return blocks, header_planes, header_per_plane
+
+
+def read_tle_file(path: Path):
+    blocks, header_planes, header_per_plane = read_tle_records(path)
     epoch = parse_tle_epoch(blocks[0][1])
     satellites = [ephem.readtle(name, l1, l2) for name, l1, l2 in blocks]
     return satellites, epoch, header_planes, header_per_plane
+
+
+def _tle_checksum(line):
+    return str(sum(int(char) if char.isdigit() else (1 if char=="-" else 0) for char in line)%10)
+
+
+def _tle_with_number(record,number):
+    name,line1,line2=record
+    line1=line1[:2]+f"{number:05d}"+line1[7:68]
+    line2=line2[:2]+f"{number:05d}"+line2[7:68]
+    return name,line1+_tle_checksum(line1),line2+_tle_checksum(line2)
+
+
+def _analytic_tle_record(name,number,inclination_deg,raan_deg,phase_deg,mean_motion):
+    line1=f"1 {number:05d}U 00000ABC 00001.00000000  .00000000  00000-0  00000+0 0    0"
+    line2=f"2 {number:05d} {inclination_deg:8.4f} {raan_deg%360:8.4f} 0000001 {0.:8.4f} {phase_deg%360:8.4f} {mean_motion:11.8f}    0"
+    return name,line1+_tle_checksum(line1),line2+_tle_checksum(line2)
 
 
 def make_candidates(planes: int, per_plane: int, isl_pattern: str,
@@ -868,7 +930,7 @@ class SimulationWorker(QObject):
         try:
             cfg = self.config
             analytic_walker = cfg.source == "walker" and cfg.eccentricity <= 0.000001
-            analytic_params = []
+            analytic_params = [];tle_records=[]
             self.progress.emit(2, "准备阶段 1/4：检查场景参数")
             if cfg.source == "walker":
                 if cfg.walker_mode not in ("multi_shell","document_4_shell") and cfg.satellite_count%cfg.planes:
@@ -893,10 +955,13 @@ class SimulationWorker(QObject):
                                 for slot in range(shell_per_plane):
                                     phase=2*math.pi*(slot/shell_per_plane+local_plane/(shell_planes*shell_per_plane))
                                     analytic_params.append((semi_major_m,math.radians(inclination),raan,phase,angular_rate))
+                                    label=f"{shell.get('name',f'L{shell_index+1}')}-P{local_plane+1:03d}-S{slot+1:03d}"
+                                    tle_records.append(_analytic_tle_record(label,sat_offset+local_plane*shell_per_plane+slot+1,inclination,math.degrees(raan),math.degrees(phase),mean_motion))
                         else:
                             tle_path=Path(tmp)/f"walker_shell_{shell_index+1}.tles"
                             satgen.generate_tles_from_scratch_manual(str(tle_path),f"QT-{shell.get('name',shell_index+1)}",shell_planes,shell_per_plane,False,inclination,cfg.eccentricity,cfg.arg_perigee_deg,mean_motion,180.0 if cfg.walker_layout=="star" else 360.0)
                             shell_sats,shell_epoch,_,_=read_tle_file(tle_path)
+                            tle_records.extend(_tle_with_number(record,sat_offset+index+1) for index,record in enumerate(read_tle_records(tle_path)[0]))
                         epoch=epoch or shell_epoch;satellites.extend(shell_sats)
                         for local_plane in range(shell_planes):
                             satellite_planes.extend([plane_offset+local_plane]*shell_per_plane);satellite_slots.extend(range(shell_per_plane));satellite_labels.extend(f"{shell.get('name',f'L{shell_index+1}')}-P{local_plane+1:03d}-S{slot+1:03d}" for slot in range(shell_per_plane))
@@ -908,6 +973,7 @@ class SimulationWorker(QObject):
                 satellites, epoch, file_planes, file_per_plane = read_tle_file(Path(cfg.tle_path))
                 if cfg.satellite_count > 0:
                     satellites = satellites[:cfg.satellite_count]
+                tle_records=read_tle_records(Path(cfg.tle_path))[0][:len(satellites)]
                 if file_planes and len(satellites) == file_planes * file_per_plane:
                     cfg.planes = file_planes
                 if len(satellites) % cfg.planes:
@@ -917,6 +983,14 @@ class SimulationWorker(QObject):
                 satellite_shells=[0]*len(satellites)
                 satellite_labels=[f"P{satellite_planes[sid]+1:03d}-S{satellite_slots[sid]+1:03d}" for sid in range(len(satellites))]
                 shell_runs=[{"name":"TLE","planes":cfg.planes,"per_plane":per_plane,"satellite_offset":0,"plane_offset":0}]
+            if len(tle_records)!=len(satellites):raise ValueError("卫星 TLE 数量与轨道对象数量不一致")
+            tle_asset=Path(cfg.scenario_directory)/"base_data"/"satellites.tles"
+            tle_asset.parent.mkdir(parents=True,exist_ok=True)
+            temporary_tle=tle_asset.with_suffix(".building.tles")
+            tle_header=[f"{cfg.planes} {len(satellites)//cfg.planes}"] if len(satellites)%cfg.planes==0 and all(int(shell["per_plane"])==len(satellites)//cfg.planes for shell in shell_runs) else []
+            temporary_tle.write_text("\n".join((*tle_header,*(line for record in tle_records for line in record)))+"\n",encoding="utf-8")
+            temporary_tle.replace(tle_asset)
+            tle_asset_hash=hashlib.sha256(tle_asset.read_bytes()).hexdigest()
             self.progress.emit(45, f"准备阶段 2/4完成：已建立 {len(satellites):,} 个轨道传播对象")
             traffic_cells = []
             traffic_model = None
@@ -1028,7 +1102,7 @@ class SimulationWorker(QObject):
                     stat=Path(cfg.tle_path).stat();tle_signature=f"{Path(cfg.tle_path).resolve()}:{stat.st_size}:{stat.st_mtime_ns}"
                 cache_spec={"cache_version":2,"source":cfg.source,"tle":tle_signature,"shells":cfg.walker_shells,"count":len(satellites),"planes":cfg.planes,"layout":cfg.walker_layout,"altitude":cfg.altitude_km,"inclination":cfg.inclination_deg,"eccentricity":cfg.eccentricity,"arg_perigee":cfg.arg_perigee_deg,"duration":cfg.duration_s,"step":cfg.step_s}
                 cache_key=hashlib.sha256(json.dumps(cache_spec,sort_keys=True,ensure_ascii=False).encode("utf-8")).hexdigest()[:24]
-                cache_file=(cache_root/"orbit_positions.npy") if cfg.result_directory else (cache_root/f"{cache_key}.npy");meta_file=(cache_root/"orbit_positions.json") if cfg.result_directory else (cache_root/f"{cache_key}.json")
+                cache_file=(cache_root/"orbit_positions.npy") if cfg.scenario_directory else (cache_root/f"{cache_key}.npy");meta_file=(cache_root/"orbit_positions.json") if cfg.scenario_directory else (cache_root/f"{cache_key}.json")
                 if cache_file.is_file() and meta_file.is_file():
                     try:
                         meta=json.loads(meta_file.read_text(encoding="utf-8"))
@@ -1045,7 +1119,7 @@ class SimulationWorker(QObject):
                     temporary=cache_file.with_suffix(".building.npy");orbit_cache=np.lib.format.open_memmap(temporary,mode="w+",dtype="float32",shape=(total_frames,len(satellites),6))
                     cache_observer=ephem.Observer();cache_observer.lat="0";cache_observer.lon="0";cache_observer.elevation=0
                     for cache_index in range(total_frames):
-                        if self._stop.is_set():raise RuntimeError("基础数据生成已取消")
+                        if self._stop.is_set():return
                         cache_time=min(cache_index*cfg.step_s,cfg.duration_s)
                         if analytic_walker:
                             params=np.asarray(analytic_params,dtype=float);radius=params[:,0];inc=params[:,1];raan=params[:,2];u=params[:,3]+params[:,4]*cache_time
@@ -1072,7 +1146,7 @@ class SimulationWorker(QObject):
                 if cfg.traffic_grid_path and Path(cfg.traffic_grid_path).is_file():
                     traffic_stat=Path(cfg.traffic_grid_path).stat();traffic_source_signature=f"{Path(cfg.traffic_grid_path).resolve()}:{traffic_stat.st_size}:{traffic_stat.st_mtime_ns}"
                 traffic_spec={"cache_version":3,"access_split_policy":"normal2_dense4","orbit_key":cache_key,"grid":traffic_source_signature,"cells":len(traffic_cells),"outside_china_percent":cfg.traffic_outside_china_percent,"min_elevation":cfg.min_elevation_deg,"dense_percentile":cfg.traffic_dense_percentile,"dense_max_satellites":cfg.traffic_dense_max_satellites,"random_sigma":cfg.traffic_random_sigma,"total_gbps":cfg.traffic_total_gbps,"cluster_radius":cfg.traffic_cluster_radius_km,"frames":total_frames,"step":cfg.step_s,"update_period_s":traffic_update_period_s,"keyframes":traffic_keyframes}
-                traffic_key=hashlib.sha256(json.dumps(traffic_spec,sort_keys=True,ensure_ascii=False).encode("utf-8")).hexdigest()[:24];traffic_file=(cache_root/"traffic_timeseries.sqlite") if cfg.result_directory else (cache_root/f"{traffic_key}.traffic.sqlite");traffic_cache_path=str(traffic_file)
+                traffic_key=hashlib.sha256(json.dumps(traffic_spec,sort_keys=True,ensure_ascii=False).encode("utf-8")).hexdigest()[:24];traffic_file=(cache_root/"traffic_timeseries.sqlite") if cfg.scenario_directory else (cache_root/f"{traffic_key}.traffic.sqlite");traffic_cache_path=str(traffic_file)
                 traffic_cache_connection=sqlite3.connect(str(traffic_file),check_same_thread=False);traffic_cache_connection.execute("PRAGMA journal_mode=WAL");traffic_cache_connection.execute("PRAGMA synchronous=NORMAL");traffic_cache_connection.execute("CREATE TABLE IF NOT EXISTS metadata(key TEXT PRIMARY KEY,value TEXT NOT NULL)");traffic_cache_connection.execute("CREATE TABLE IF NOT EXISTS frames(frame_index INTEGER PRIMARY KEY,blob BLOB NOT NULL)")
                 encoded_spec=json.dumps(traffic_spec,sort_keys=True,ensure_ascii=False,separators=(",",":"))
                 stored=traffic_cache_connection.execute("SELECT value FROM metadata WHERE key='spec'").fetchone();count=traffic_cache_connection.execute("SELECT COUNT(*) FROM frames").fetchone()[0]
@@ -1088,7 +1162,7 @@ class SimulationWorker(QObject):
                     # avoiding process startup, IPC copies and scheduling stalls.
                     self.progress.emit(82+round(15*completed/traffic_keyframe_count),f"准备阶段 4/4：顺序计算业务关键帧 {completed:,}/{traffic_keyframe_count:,}…")
                     for cache_index in missing:
-                        if self._stop.is_set():raise RuntimeError("业务时变缓存生成已取消")
+                        if self._stop.is_set():return
                         cached=np.asarray(orbit_cache[cache_index]);position_array=np.empty((len(satellites),5),dtype=np.float64);position_array[:,0]=np.arange(len(satellites));position_array[:,1]=satellite_planes;position_array[:,2:5]=cached[:,0:3]
                         traffic_rows,satellite_rows,_=compute_traffic_rows(traffic_model,traffic_cells,position_array,cfg.min_elevation_deg,epoch+timedelta(seconds=min(cache_index*cfg.step_s,cfg.duration_s)))
                         blob=zlib.compress(marshal.dumps((traffic_rows,satellite_rows)),1);traffic_cache_connection.execute("INSERT OR REPLACE INTO frames(frame_index,blob) VALUES(?,?)",(cache_index,blob));completed+=1
@@ -1203,6 +1277,7 @@ class SimulationWorker(QObject):
                 "traffic_cache_preloaded":bool(traffic_cache_blobs is not None),"traffic_cache_compressed_mb":round(compressed_bytes/1024/1024,1),
                 "traffic_update_period_s":traffic_update_period_s,"traffic_keyframe_count":traffic_keyframe_count,
                 "satellite_labels": satellite_labels,
+                "tle_asset_path":str(tle_asset),"tle_asset_hash":tle_asset_hash,
                 "step_s": cfg.step_s,
                 "latitude_limit": cfg.latitude_limit_deg, "stations": cfg.stations,
                 "min_elevation_deg": cfg.min_elevation_deg, "max_gsl_km": cfg.max_gsl_km,
@@ -1276,6 +1351,7 @@ class SimulationWorker(QObject):
                 if scheduling_request is not None and planner is not None:
                     planner.config.fast_evaluation_period_s,planner.config.fast_adjust_period_s,planner.config.route_update_period_s,planner.config.freeze_window_s,planner.config.capacity_threshold_ratio,planner.config.switching_loss_ratio=scheduling_request
                 if offline_requested and planner is not None:
+                    if self._stop.is_set():return
                     grades=(("轻雨",5.0),("中雨",1.0),("重雨",0.1));catalog=[];planning_interval_s=300
                     offline_spec={"cache_version":13,"algorithm_version":29,"candidate_label_cost":"isl_plus_gsl_v1","max_isl_km":cfg.max_isl_km,"latitude_limit_deg":cfg.latitude_limit_deg,"isl_pattern":cfg.isl_pattern,"seam_enabled":cfg.seam_enabled,"seam_after_plane":cfg.seam_after_plane,"fixed_feeder_visibility":"sampled_full_300s_v1","planning_traffic_sampling":"six_samples_mean_spatial_peak_total_v1","capacity_safe_latency":"local_self_first_v2","delay_score":"smooth_15ms_v1","planning_exit_limit":8,"objective_formula":"capacity_then_delay_lexicographic_v1","delay_diversity":"none","gateway_channel_capacity_gbps":2.0,"feeder_selection":"capacity_first_spatial_diversity_v1","feeder_min_separation_deg":8.0,"feeder_diversity_target_deg":25.0,"rain_spatial_model":"correlated_cells_v1","joint_link_repair":"delivery_first_single_pass_v1","orbit_key":cache_key,"traffic_key":traffic_key,
                         "gateway_cache_version":(gateway_deployment.get("cache_spec") or {}).get("cache_version",0),"station_signature":[[s.get("name"),s.get("lat"),s.get("lon"),s.get("channel_count"),s.get("antenna_count")] for s in cfg.stations],
@@ -1286,6 +1362,7 @@ class SimulationWorker(QObject):
                         "modcod":[[row.name,row.minimum_snr_db,row.spectral_efficiency,row.rate_gbps] for row in planner.config.modcod_table],
                         "priority_regions":list(planner.config.priority_task_regions),
                         "gso":[planner.config.geo_interference_enabled,planner.config.geo_satellite_count,planner.config.gso_i_over_n_db,planner.config.gso_protection_angle_deg]}
+                    offline_spec["tle_asset_hash"]=tle_asset_hash
                     if planner.config.selection_strategy=="window_margin":offline_spec.update(cache_version=16,algorithm_version=32,objective_formula="weighted_window_mean_capacity_delay_v4",selection_strategy="window_margin",window_sampling="six_points_mean_and_min_rate_v1")
                     offline_spec_hash=hashlib.sha256(json.dumps(offline_spec,ensure_ascii=False,sort_keys=True,separators=(",",":")).encode("utf-8")).hexdigest()
                     offline_cache_path=Path(cfg.scenario_directory)/"base_data"/"offline_plans.json" if cfg.scenario_directory else None
@@ -1307,6 +1384,7 @@ class SimulationWorker(QObject):
                                 catalog=cached_offline["plans"];cached_statistics=cached_offline.get("statistics") or {}
                         except (OSError,ValueError,TypeError):catalog=[]
                     if catalog:
+                        if self._stop.is_set():return
                         batch_total_ms=float(cached_statistics.get("total_calculation_ms",catalog[0].get("batch_total_calculation_ms",sum(float(p.get("calculation_ms",0)) for p in catalog))))
                         for plan in catalog:plan["batch_total_calculation_ms"]=batch_total_ms;plan["planning_cache_reused"]=True;plan["planning_spec_hash"]=offline_spec_hash
                         record_offline_asset(True,{"total_calculation_ms":batch_total_ms,"average_calculation_ms":float(cached_statistics.get("average_calculation_ms",0)),"maximum_calculation_ms":float(cached_statistics.get("maximum_calculation_ms",0))})
@@ -1317,6 +1395,7 @@ class SimulationWorker(QObject):
                         continue
                     planning_started=time.perf_counter();self.progress.emit(1,"离线规划：正在生成18个规划方案")
                     for epoch_index,plan_time in enumerate(range(0,1800,planning_interval_s)):
+                        if self._stop.is_set():return
                         frame_at=min(total_frames-1,max(0,round(plan_time/cfg.step_s)))
                         cached=np.asarray(orbit_cache[frame_at]);count=len(satellites)
                         position_array=np.empty((count,5),dtype=np.float64);position_array[:,0]=np.arange(count);position_array[:,1]=satellite_planes;position_array[:,2:4]=np.round(cached[:,0:2],6);position_array[:,4]=np.round(cached[:,2],1)
@@ -1335,6 +1414,7 @@ class SimulationWorker(QObject):
                                   for pair,elevation in stable.items()} if planner.config.selection_strategy=="window_margin" else None
                         sample_times=[min(plan_time+offset,1799) for offset in (60,120,180,240,299)]
                         for sample_time in sample_times:
+                            if self._stop.is_set():return
                             sample_index=min(total_frames-1,max(0,round(sample_time/cfg.step_s)))
                             sample_cached=np.asarray(orbit_cache[sample_index]);sample_xyz=sample_cached[:,3:6]
                             sample_rows,_=compute_gsl_rows(sample_xyz,cfg.stations,cfg.min_elevation_deg,cfg.max_gsl_km)
@@ -1363,6 +1443,7 @@ class SimulationWorker(QObject):
                         scale=max(sample_totals)/average_total if average_total>1e-12 else 1.
                         plan_traffic=[[sid,amount*scale/len(sample_totals)] for sid,amount in traffic_sum.items() if amount>1e-12]
                         for grade,scenario_percentile in grades:
+                            if self._stop.is_set():return
                             plan_started=time.perf_counter()
                             window_rates=None
                             if profiles is not None:
@@ -1379,13 +1460,18 @@ class SimulationWorker(QObject):
                                                                          "rain_attenuation_db":fade,"worst_elevation_deg":elevation,
                                                                          "worst_time_s":worst_time}
                             plan=planner.generate(plan_time,plan_positions,plan_links,plan_gsls,plan_traffic,rain_scenario_percentile=scenario_percentile,rain_grade=grade,commit=False,window_rates=window_rates)
+                            if self._stop.is_set():return
                             plan.update(id=f"offline_{grade}_{plan_time}",generation=len(catalog)+1,offline=True,epoch_index=epoch_index,
                                         valid_from_s=float(plan_time),valid_until_s=float(plan_time+planning_interval_s),calculation_ms=round((time.perf_counter()-plan_started)*1000,3),
                                         full_window_visibility_required=True,visibility_sample_times_s=[plan_time]+sample_times,
-                                        stable_visible_candidate_count=len(plan_gsls))
+                                        stable_visible_candidate_count=len(plan_gsls),tle_asset="base_data/satellites.tles",tle_asset_hash=tle_asset_hash)
+                            for link in plan.get("links",[]):
+                                name,line1,line2=tle_records[int(link["satellite"])]
+                                link["tle"]={"name":name,"line1":line1,"line2":line2}
                             catalog.append(plan)
                             self.progress.emit(round(100*len(catalog)/18),f"离线规划：已完成 {len(catalog)}/18，{plan_time//60:02d}:00 {grade}，本方案 {plan['calculation_ms']/1000:.1f}s")
                     self._offline_catalog=catalog;self._installed_offline_key=None
+                    if self._stop.is_set():return
                     total_planning_ms=round((time.perf_counter()-planning_started)*1000,3)
                     statistics={"total_calculation_ms":total_planning_ms,"average_calculation_ms":round(sum(float(p.get("calculation_ms",0)) for p in catalog)/max(1,len(catalog)),3),"maximum_calculation_ms":max((p.get("calculation_ms",0) for p in catalog),default=0),"generated_at":datetime.now().astimezone().isoformat()}
                     for plan in catalog:plan["batch_total_calculation_ms"]=total_planning_ms;plan["planning_cache_reused"]=False;plan["planning_spec_hash"]=offline_spec_hash
@@ -1555,11 +1641,11 @@ class SimulationWorker(QObject):
                 # appearing in the displayed compute time.  Do it here as an explicit,
                 # measurable frame stage; the writer only performs SQLite I/O.
                 storage_started=time.perf_counter()
-                result_blob=b"M"+zlib.compress(marshal.dumps(frame_payload),1)
+                result_blob=b"M"+zlib.compress(marshal.dumps(frame_payload),1) if self.result_store is not None else None
                 storage_ms=(time.perf_counter()-storage_started)*1000
                 timings["storage_ms"]=round(storage_ms,1)
                 frame_payload["process_ms"]=round(compute_ms+storage_ms,1)
-                frame_payload["_result_blob"]=result_blob
+                if result_blob is not None:frame_payload["_result_blob"]=result_blob
                 if self.result_store is not None:self.result_store.write_frame(frame_payload)
                 interval_ms=1000*cfg.step_s/max(0.01,self._speed)
                 append_diagnostic(diagnostic_path,"frame_computed",frame=frame_index,sim_time_s=sim_time,interval_budget_ms=round(interval_ms,1),process_ms=frame_payload["process_ms"],timings_ms=timings,satellite_count=len(positions),same_isl_count=same_count,cross_isl_count=cross_count,gsl_count=len(gsls),traffic_cell_count=len(traffic_rows))
@@ -1874,15 +1960,7 @@ class MainWindow(QMainWindow):
 
     def _refresh_cesium_view(self):
         if hasattr(self,"web") and self.web_ready:
-            self.web.page().runJavaScript("viewer.resize(); viewer.scene.requestRender();")
-
-    def _choose_result_path(self):
-        result_dir=ROOT/"simulation_results"; result_dir.mkdir(parents=True,exist_ok=True)
-        root=QFileDialog.getExistingDirectory(self,"选择场景结果保存根目录",str(result_dir))
-        if not root:self._refresh_cesium_view();return
-        try:cfg=self._config();folder_name=self._result_scene_folder_name(cfg)
-        except Exception as exc:QMessageBox.warning(self,"场景参数错误",str(exc));return
-        self.requested_result_path=Path(root)/folder_name;self.status.setText(f"场景结果将分片保存到：{self.requested_result_path}");self._refresh_cesium_view()
+            self.web.page().runJavaScript("if(window.viewer){viewer.forceResize();viewer.scene.requestRender();}")
 
     @staticmethod
     def _result_scene_folder_name(cfg):
@@ -1893,7 +1971,7 @@ class MainWindow(QMainWindow):
 
     @staticmethod
     def _public_scenario(cfg):
-        config=asdict(cfg);config.pop("result_directory",None);config.pop("scenario_directory",None)
+        config=asdict(cfg);config.pop("result_directory",None);config.pop("scenario_directory",None);config.pop("speed",None)
         encoded=json.dumps(config,sort_keys=True,ensure_ascii=False,separators=(",",":"));scenario_hash=hashlib.sha256(encoded.encode("utf-8")).hexdigest()
         source=("WalkerStar" if cfg.walker_layout=="star" else "WalkerDelta") if cfg.source=="walker" else f"TLE-{Path(cfg.tle_path).stem or '场景'}"
         shell_label=f"{len(cfg.walker_shells)}壳层" if cfg.source=="walker" and cfg.walker_shells else f"{cfg.altitude_km:g}km_{cfg.inclination_deg:g}度"
@@ -2101,7 +2179,7 @@ class MainWindow(QMainWindow):
         self.walker_layout=QComboBox(); self.walker_layout.addItems(["Walker Delta（RAAN 360°）", "Walker Star（RAAN 180°，自动启用轨道缝隙）"])
         self.duration=self._spin(1800,1800,1800,0," s"); self.duration.setToolTip("当前离线规划固定覆盖30分钟，共6个五分钟周期。")
         self.step=self._spin(0.1,3600,1,2," s"); self.step.setToolTip("仿真输出的时间步长；步长越小，帧数和计算耗时越多。")
-        self.speed=QComboBox(); self.speed.addItems(["0.5×","1×","2×","5×"]); self.speed.setCurrentText("1×"); self.speed.setFixedWidth(72);self.speed.setToolTip("结果播放速度，不改变轨道、规划或链路计算结果。")
+        self.speed=QComboBox(); self.speed.addItems(["1×","2×","5×"]); self.speed.setCurrentText("1×"); self.speed.setFixedWidth(72);self.speed.setToolTip("结果播放速度，不改变轨道、规划或链路计算结果。")
         self.satellite_antennas=self._spin(1,32,4);self.satellite_channels=self._spin(1,128,4);self.satellite_channel_capacity=self._spin(0.1,1000,10,1," Gb/s");self.geo_interference=QCheckBox("纳入同频GEO/GSO干扰");self.geo_interference.setChecked(True)
         self.geo_satellite_count=self._spin(1,12,3);self.geo_center_longitude=self._spin(-180,180,110,1,"°E");self.geo_longitude_spacing=self._spin(1,60,30,1,"°");self.geo_altitude=self._spin(35000,37000,35786,0," km");self.gso_i_over_n=self._spin(-30,0,-12,1," dB");self.gso_protection_angle=self._spin(0,30,10,1,"°")
         self.isl_pattern=QComboBox(); self.isl_pattern.addItems(["4-ISL规则网格", "3-ISL固定砖墙"])
@@ -2347,12 +2425,11 @@ class MainWindow(QMainWindow):
         pause_action=self._action("暂停",QStyle.StandardPixmap.SP_MediaPause,self._pause_simulation);self.pause_btn=pause_action;self.pause_btn.setEnabled(False)
         stop_action=self._action("结束",QStyle.StandardPixmap.SP_MediaStop,self.stop_simulation); self.stop_btn=stop_action; self.stop_btn.setEnabled(False)
         save_layout=self._action("保存当前布局",QStyle.StandardPixmap.SP_DialogSaveButton,self._save_layout); restore_layout=self._action("加载保存布局",QStyle.StandardPixmap.SP_DialogOpenButton,self._restore_layout); reset_layout=self._action("恢复默认布局",QStyle.StandardPixmap.SP_BrowserReload,self._reset_layout)
-        choose_result_path_action=self._action("保存仿真结果",QStyle.StandardPixmap.SP_DialogSaveButton,self._choose_result_path); choose_result_path_action.setToolTip("选择场景结果根目录，时变数据将自动分片保存")
-        open_result_action=self._action("回放仿真结果",QStyle.StandardPixmap.SP_DialogOpenButton,self._open_result_package)
-        export_action=self._action("导出基础数据",QStyle.StandardPixmap.SP_DialogSaveButton,self.export_basic_data); export_tables_action=self._action("导出全部表格",QStyle.StandardPixmap.SP_DialogSaveButton,self._export_all_result_tables); compare_action=self._action("结果对比",QStyle.StandardPixmap.SP_FileDialogDetailedView,lambda:self._notify_pending("多场景 / 多策略结果对比")); about_action=self._action("关于",QStyle.StandardPixmap.SP_MessageBoxInformation,lambda:QMessageBox.information(self,"关于","星地馈电链路与星座仿真验证系统\n链路计算、链路仿真与星座仿真一体化工作台"))
+        save_simulation_data_action=self._action("保存仿真数据",QStyle.StandardPixmap.SP_DialogSaveButton,self._save_simulation_data);save_simulation_data_action.setToolTip("导出当前调度执行和效能评估页面的摘要、表格与趋势图")
+        export_action=self._action("导出基础数据",QStyle.StandardPixmap.SP_DialogSaveButton,self.export_basic_data); export_tables_action=self._action("导出全部表格",QStyle.StandardPixmap.SP_DialogSaveButton,self._export_all_result_tables); about_action=self._action("关于",QStyle.StandardPixmap.SP_MessageBoxInformation,lambda:QMessageBox.information(self,"关于","星地馈电链路与星座仿真验证系统\n链路计算、链路仿真与星座仿真一体化工作台"))
         scene_menu=self.menuBar().addMenu("场景"); scene_menu.addActions([import_scene,export_scene])
         simulation_menu=self.menuBar().addMenu("仿真"); simulation_menu.addActions([prepare_action,offline_plan_action,run_action,run_all_action,pause_action,stop_action])
-        data_menu=self.menuBar().addMenu("数据"); data_menu.addActions([choose_result_path_action,open_result_action]); data_menu.addSeparator(); data_menu.addActions([export_action,export_tables_action,compare_action])
+        data_menu=self.menuBar().addMenu("数据"); data_menu.addAction(save_simulation_data_action); data_menu.addSeparator(); data_menu.addActions([export_action,export_tables_action])
         view_menu=self.menuBar().addMenu("视图"); view_menu.addActions([save_layout,restore_layout,reset_layout])
         self.fullscreen_action=QAction("全屏显示",self);self.fullscreen_action.setCheckable(True);self.fullscreen_action.setShortcut("F11");self.fullscreen_action.triggered.connect(self.set_fullscreen);view_menu.addAction(self.fullscreen_action)
         self.exit_fullscreen_action=QAction("退出全屏",self);self.exit_fullscreen_action.setShortcut("Esc");self.exit_fullscreen_action.setEnabled(False);self.exit_fullscreen_action.triggered.connect(self.exit_fullscreen);self.addAction(self.exit_fullscreen_action)
@@ -2362,11 +2439,11 @@ class MainWindow(QMainWindow):
         help_menu=self.menuBar().addMenu("帮助"); help_menu.addAction(about_action)
         toolbar=self.addToolBar("常用命令"); toolbar.setObjectName("mainToolbar"); toolbar.setMovable(True); toolbar.setToolButtonStyle(Qt.ToolButtonStyle.ToolButtonTextBesideIcon)
         icon_dir=Path(__file__).with_name("assets")
-        for action,name in ((import_scene,"tle-import.svg"),(export_scene,"export.svg"),(run_all_action,"run.svg"),(prepare_action,"prepare-data.svg"),(offline_plan_action,"offline-plan.svg"),(run_action,"run.svg"),(pause_action,"pause.svg"),(stop_action,"stop.svg"),(choose_result_path_action,"export.svg"),(open_result_action,"tle-import.svg"),(export_action,"export.svg"),(export_tables_action,"export.svg")):
+        for action,name in ((import_scene,"tle-import.svg"),(export_scene,"export.svg"),(run_all_action,"run.svg"),(prepare_action,"prepare-data.svg"),(offline_plan_action,"offline-plan.svg"),(run_action,"run.svg"),(pause_action,"pause.svg"),(stop_action,"stop.svg"),(save_simulation_data_action,"export.svg"),(export_action,"export.svg"),(export_tables_action,"export.svg")):
             icon_file=icon_dir/name
             if icon_file.exists():action.setIcon(QIcon(str(icon_file)))
         toolbar.addActions([prepare_action,offline_plan_action,run_action,run_all_action]);toolbar.addSeparator()
-        toolbar.addActions([pause_action,stop_action]);toolbar.addSeparator();toolbar.addAction(export_tables_action);toolbar.addSeparator()
+        toolbar.addActions([pause_action,stop_action]);toolbar.addSeparator();toolbar.addAction(save_simulation_data_action);toolbar.addSeparator()
         self.duration.setMaximumWidth(92);self.step.setMaximumWidth(82)
         toolbar.addWidget(QLabel("时长"));toolbar.addWidget(self.duration);toolbar.addWidget(QLabel("步进"));toolbar.addWidget(self.step);toolbar.addWidget(QLabel("倍速"));toolbar.addWidget(self.speed);toolbar.addSeparator()
         status_bar=self.statusBar();status_bar.setSizeGripEnabled(False);status_bar.setFixedHeight(36)
@@ -2435,13 +2512,13 @@ class MainWindow(QMainWindow):
         if index==0:
             self.planning_map_layout.addWidget(self.map_workspace)
             if self.web_ready:self.web.page().runJavaScript("setViewPage('planning')")
-            QTimer.singleShot(0,self._refresh_cesium_view)
+            for delay in (0,100,300):QTimer.singleShot(delay,self._refresh_cesium_view)
         elif index==2 and self.current_full_frame and self.active_config:
             self.planning_resources.update_frame(self.current_full_frame,[x["name"] for x in self.active_config.stations])
         elif index==4:
             self.input_map_layout.addWidget(self.map_workspace)
             if self.web_ready:self.web.page().runJavaScript(f"setViewPage('{self.input_view_mode}')")
-            QTimer.singleShot(0,self._refresh_cesium_view)
+            for delay in (0,100,300):QTimer.singleShot(delay,self._refresh_cesium_view)
         self._sync_worker_display_options()
 
     def _sync_result_gateway_scope(self,source):
@@ -2527,7 +2604,7 @@ class MainWindow(QMainWindow):
         available=max(240,self.main_splitter.width()-left-right-self.main_splitter.handleWidth()*2)
         self.main_splitter.setSizes([left,available,right])
         if hasattr(self,"web") and self.web_ready:
-            QTimer.singleShot(0,lambda:self.web.page().runJavaScript("if(window.viewer){viewer.resize();viewer.scene.requestRender();}"))
+            QTimer.singleShot(0,self._refresh_cesium_view)
 
     def _set_scenario_editable(self,editable):
         for widget in self.scenario_edit_widgets:widget.setEnabled(editable)
@@ -2746,8 +2823,8 @@ class MainWindow(QMainWindow):
             QMessageBox.information(self,"一键运行","请先关闭当前仿真结果回放。")
             return
         if self.worker is not None and self.prepared_ready and self.is_paused and self._simulation_at_end():
-            self._run_all_after_stop=True
             self.stop_simulation()
+            self._run_all_after_stop=True
             return
         if self.worker is not None and not (self.prepared_ready and self.is_paused and self.current_full_frame is None):
             QMessageBox.information(self,"一键运行","当前任务正在运行，请结束后再执行一键运行。")
@@ -2838,6 +2915,7 @@ class MainWindow(QMainWindow):
 
     @Slot(list)
     def _offline_planning_ready(self,catalog):
+        if self.user_stopping:return
         self.busy_overlay.stop();self.offline_planning_started_at=None
         self.planning_results.set_offline_catalog(catalog);self.planning_results.result_tabs.setCurrentIndex(0);self.planning_tabs.setCurrentIndex(1);self.offline_plan_btn.setEnabled(True)
         self._populate_planning_choices(catalog)
@@ -2890,14 +2968,9 @@ class MainWindow(QMainWindow):
             QMessageBox.warning(self,"仿真时长","离线规划固定覆盖30分钟，请将仿真时长设置为1800秒后重新生成基础数据。")
             return
         if self.result_store:self.result_store.close()
-        result_dir=ROOT/"simulation_results"; result_dir.mkdir(parents=True,exist_ok=True)
-        result_name=self._result_scene_folder_name(cfg)
-        self.result_store_path=self.requested_result_path or (result_dir/result_name);self.result_store_path.mkdir(parents=True,exist_ok=True);self.requested_result_path=None
-        scenario_id,scenario_hash,scenario_dir=self._public_scenario(cfg);cfg.result_directory=str(self.result_store_path);cfg.scenario_directory=str(scenario_dir)
-        scenario_reference={"scenario_id":scenario_id,"config_hash":scenario_hash,"scenario_path":os.path.relpath(scenario_dir,self.result_store_path).replace("\\","/"),"scenario_config":"scenario_config.json"}
-        (self.result_store_path/"scenario_reference.json").write_text(json.dumps(scenario_reference,ensure_ascii=False,indent=2),encoding="utf-8")
-        self.result_store=ResultStore(self.result_store_path,True,chunk_frames=30);self.result_store.set_metadata("format",{"name":"Hypatia chunked scenario result","version":4,"encoding":"marshal","compression":"zlib-fast","chunk_frames":30});self.result_store.set_metadata("scenario_name",self.result_store_path.name);self.result_store.set_metadata("config",asdict(cfg));self.loaded_result=False
-        self.result_store.set_metadata("scenario_reference",scenario_reference)
+        _scenario_id,_scenario_hash,scenario_dir=self._public_scenario(cfg)
+        cfg.scenario_directory=str(scenario_dir);cfg.result_directory=""
+        self.result_store=None;self.result_store_path=None;self.requested_result_path=None;self.loaded_result=False
         self.active_config=cfg; self.prepared_ready=False; self.prepared_metadata=None; self.summary_history.clear(); self.planning_results.clear();self.planning_resources.clear();self.planning_evaluation.clear();self._populate_planning_choices([]); self._refresh_parameter_actions(); self.preparation_started_at=time.perf_counter();self.run_started_at=None;self.run_elapsed_s=0.0;self.elapsed_phase="preparation";self.elapsed_label.setText("准备耗时 00:00:00");self.cache_status_label.setText("● 轨道缓存 检查中　● 业务缓存 等待");self.cache_status_label.setStyleSheet("QLabel{color:#ff6675;background:#35131b;border:1px solid #ff3b4f;border-radius:3px;padding:3px 8px;font-weight:700}"); self.state_badge.setText("● 准备中"); self.alert_label.setText("告警 0"); self._set_scenario_editable(False);self.busy_overlay.start("正在检查并生成场景基础数据…")
         self._set_property_drawer(False)
         self.user_stopping = False; self.prepared_ready = False
@@ -2912,6 +2985,7 @@ class MainWindow(QMainWindow):
         self._sync_run_controls()
     @Slot(dict)
     def _prepared(self,data):
+        if self.user_stopping:return
         self.busy_overlay.stop()
         preparation_seconds=max(0,int(time.perf_counter()-self.preparation_started_at)) if self.preparation_started_at is not None else 0
         data["preparation_elapsed_s"]=preparation_seconds
@@ -3526,6 +3600,43 @@ class MainWindow(QMainWindow):
             append_diagnostic(str(Path(self.active_config.result_directory)/"time_variation.jsonl") if self.active_config.result_directory else "","frame_render_transfer_finished",frame=getattr(self,"transfer_frame_index",-1),transfer_ms=round((time.perf_counter()-getattr(self,"transfer_started_at",time.perf_counter()))*1000,1),rows=getattr(self,"transfer_row_counts",{}),replacement_waiting=self.pending_frame is not None)
         QTimer.singleShot(0,self._send_next)
 
+    def _save_simulation_data(self):
+        tables=(
+            ("调度执行_执行时序",self.planning_resources.history),
+            ("调度执行_信关站资源",self.planning_resources.deployment),
+            ("调度执行_馈电链路",self.planning_resources.links),
+            ("效能评估_关键事件",self.planning_evaluation.events),
+        )
+        if not any(table.rowCount() for _,table in tables) and not self.planning_evaluation.chart.rows:
+            QMessageBox.information(self,"保存仿真数据","当前还没有调度执行或效能评估数据。")
+            return
+        root=QFileDialog.getExistingDirectory(self,"选择仿真数据保存位置",str(ROOT))
+        if not root:return
+        output=Path(root)/f"仿真数据_{datetime.now().strftime('%Y%m%d_%H%M%S')}"
+        try:
+            output.mkdir(parents=True,exist_ok=False)
+            (output/"调度执行_摘要.txt").write_text(self.planning_resources.summary.text(),encoding="utf-8")
+            (output/"效能评估_摘要.txt").write_text(self.planning_evaluation.summary.text(),encoding="utf-8")
+            for name,table in tables:
+                columns=[column for column in range(table.columnCount()) if not table.isColumnHidden(column)]
+                with (output/f"{name}.csv").open("w",encoding="utf-8-sig",newline="") as stream:
+                    writer=csv.writer(stream)
+                    writer.writerow([table.horizontalHeaderItem(column).text() if table.horizontalHeaderItem(column) else f"第{column+1}列" for column in columns])
+                    for row in range(table.rowCount()):
+                        writer.writerow([table.item(row,column).text() if table.item(row,column) else "" for column in columns])
+            for name,headers,chart in (
+                ("效能评估_业务容量",["时刻 s","落地需求 Gb/s","已送达 Gb/s","可用链路容量 Gb/s"],self.planning_evaluation.chart),
+                ("效能评估_传播时延",["时刻 s","加权平均时延 ms","P95时延 ms"],self.planning_evaluation.delay_chart),
+            ):
+                with (output/f"{name}.csv").open("w",encoding="utf-8-sig",newline="") as stream:
+                    writer=csv.writer(stream);writer.writerow(headers);writer.writerows(chart.rows)
+            if not self.planning_evaluation.save_charts_image(output/"效能评估_趋势图.png"):
+                raise OSError("效能评估趋势图保存失败")
+            self.status.setText(f"仿真数据已保存到 {output}")
+            QMessageBox.information(self,"保存仿真数据",f"已保存到：\n{output}")
+        except Exception as exc:
+            QMessageBox.critical(self,"保存仿真数据失败",f"{type(exc).__name__}: {exc}")
+
     def _export_all_result_tables(self):
         tables=(
             ("规划方案_规划批次",self.planning_results.plans),
@@ -3547,7 +3658,7 @@ class MainWindow(QMainWindow):
             for name,table in tables:
                 path=output/f"{name}.csv"
                 if name=="规划方案_馈电链路" and self.planning_results.offline_catalog:
-                    headers=["生效时刻","雨衰工况","信关站","规划馈电卫星","规划仰角","规划采用雨衰 dB","Es/N0 dB","调制编码","规划容量 Gb/s","雨衰等级"]
+                    headers=["生效时刻","雨衰工况","信关站","规划馈电卫星","5分钟采样最低仰角","规划采用雨衰 dB","Es/N0 dB","调制编码","规划容量 Gb/s","雨衰等级","TLE名称","TLE第1行","TLE第2行"]
                     rows=[]
                     for plan in self.planning_results.offline_catalog:
                         valid_from=float(plan.get("valid_from_s",0));time_text=f"{int(valid_from//60):02d}:{int(valid_from%60):02d}"
@@ -3555,7 +3666,8 @@ class MainWindow(QMainWindow):
                             rows.append([time_text,plan.get("rain_grade","--"),f"GW-{int(link.get('gateway',0))+1:02d}",
                                 f"SAT-{int(link.get('satellite',0))+1:05d}",f"{float(link.get('elevation_deg',0)):.2f}°",
                                 f"{float(link.get('rain_attenuation_db',0)):.2f}",f"{float(link.get('snr_db',0)):.2f}",link.get("modcod","--"),
-                                f"{float(link.get('rate_gbps',0)):.3f}",_rain_severity_text(link.get("rain_severity","--"))])
+                                f"{float(link.get('rate_gbps',0)):.3f}",_rain_severity_text(link.get("rain_severity","--")),
+                                (link.get("tle") or {}).get("name",""),(link.get("tle") or {}).get("line1",""),(link.get("tle") or {}).get("line2","")])
                     with path.open("w",encoding="utf-8-sig",newline="") as stream:
                         writer=csv.writer(stream);writer.writerow(headers);writer.writerows(rows)
                     index_rows.append([name,len(rows),path.name]);continue
@@ -3591,6 +3703,9 @@ class MainWindow(QMainWindow):
             orbit_cache_source=Path(str(prepared.get("orbit_cache_path","")))
             if prepared.get("orbit_cache") and orbit_cache_source.is_file():
                 shutil.copy2(orbit_cache_source,out/"orbit_positions.npy");manifest["orbit_position_cache"]="orbit_positions.npy";manifest["orbit_cache_size_mb"]=prepared.get("orbit_cache_size_mb",0)
+            tle_asset_source=Path(str(prepared.get("tle_asset_path","")))
+            if tle_asset_source.is_file():
+                shutil.copy2(tle_asset_source,out/"satellites.tles");manifest["satellite_tles"]="satellites.tles";manifest["tle_asset_hash"]=prepared.get("tle_asset_hash","")
             traffic_cache_source=Path(str(prepared.get("traffic_cache_path","")))
             if prepared.get("traffic_cache") and traffic_cache_source.is_file():
                 source_db=sqlite3.connect(str(traffic_cache_source));target_db=sqlite3.connect(str(out/"traffic_timeseries.sqlite"));source_db.backup(target_db);target_db.close();source_db.close();manifest["traffic_timeseries_cache"]="traffic_timeseries.sqlite"
@@ -3699,6 +3814,7 @@ class MainWindow(QMainWindow):
             QMessageBox.critical(self,"导出失败",str(exc))
     @Slot(int,str)
     def _progress(self,value,text):
+        if self.user_stopping:return
         self.compute_progress.setValue(value);self.status.setText(text)
         if self.elapsed_phase=="preparation" or (self.offline_planning_started_at is not None and str(text).startswith("离线规划")):
             self.busy_overlay.set_progress(value,text)
@@ -3706,6 +3822,7 @@ class MainWindow(QMainWindow):
         elif "轨道缓存" in text:self.cache_status_label.setText("● 轨道缓存 生成中　● 业务缓存 等待")
     @Slot(str)
     def _failed(self,text):
+        if self.user_stopping:return
         self.busy_overlay.stop();self.offline_planning_started_at=None
         self._reset_one_click_run()
         if self.run_started_at is not None:self.run_elapsed_s+=max(0.0,time.perf_counter()-self.run_started_at);self.run_started_at=None
@@ -3713,6 +3830,7 @@ class MainWindow(QMainWindow):
         QMessageBox.critical(self,"仿真失败",text); self.status.setText(text); self.state_badge.setText("● 错误"); self.alert_label.setText("告警 1")
     @Slot()
     def _finished(self):
+        if self.user_stopping:return
         self.busy_overlay.stop()
         self._reset_one_click_run()
         if self.run_started_at is not None:self.run_elapsed_s+=max(0.0,time.perf_counter()-self.run_started_at);self.run_started_at=None
@@ -3731,6 +3849,8 @@ class MainWindow(QMainWindow):
             if self.result_store:self.result_store.close(); self.result_store=None
             self.frame_cache.clear(); self.latest_full_frame = None; self.current_full_frame = None; self.pending_frame = None
             self.summary_history.clear(); self.active_config = None; self.prepared_metadata = None
+            self.planning_results.clear();self.planning_resources.clear();self.planning_evaluation.clear()
+            self.result_store_path=None;self.scenario_planes=None;self.offline_planning_started_at=None
             self.run_started_at=None;self.run_elapsed_s=0.0;self.preparation_started_at=None;self.elapsed_phase="idle"; self.elapsed_label.setText("准备耗时 00:00:00");self.cache_status_label.setText("● 轨道缓存 --　● 业务缓存 --"); self.state_badge.setText("● 就绪"); self.alert_label.setText("告警 0")
             self.transfer_queue.clear(); self.follow_live = True; self.is_paused = False
             self.start_btn.setText("开始仿真"); self.start_btn.setEnabled(False);self.stop_btn.setEnabled(False)
@@ -3745,6 +3865,7 @@ class MainWindow(QMainWindow):
         if restart_preparation:QTimer.singleShot(0,self.start_simulation)
         elif restart_all:QTimer.singleShot(0,self._run_all_stages)
     def stop_simulation(self):
+        self._one_click_running=False;self._run_all_after_stop=False;self.regenerate_pending=False
         if self.loaded_result:
             self.result_play_timer.stop(); self.result_playing=False; self.loaded_result=False; self.loaded_frame_indices=[]
             if self.result_store:self.result_store.close(); self.result_store=None
@@ -3755,6 +3876,7 @@ class MainWindow(QMainWindow):
             return
         if self.worker:
             self.user_stopping = True; self.stop_btn.setEnabled(False); self.start_btn.setEnabled(False)
+            self.busy_overlay.stop();self.offline_planning_started_at=None
             self.state_badge.setText("● 正在停止")
             self._sync_run_controls()
             self.worker.stop(); self.status.setText("正在结束并恢复初始状态…")
