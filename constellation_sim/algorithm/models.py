@@ -1,4 +1,4 @@
-"""Shared scenario data models."""
+﻿"""Shared scenario data models."""
 
 from dataclasses import dataclass, field
 
@@ -39,7 +39,7 @@ class SimulationConfig:
     traffic_dense_max_satellites: int = 3
     traffic_random_sigma: float = 0.0
     traffic_outside_china_percent: float = 0.0
-    traffic_total_gbps: float = 1000.0
+    traffic_total_gbps: float = 500.0
     traffic_cluster_radius_km: float = 180.0
     planning_enabled: bool = True
     planning_period_s: float = 300.0
@@ -64,16 +64,32 @@ class SimulationConfig:
     walker_shells: list[dict] = field(default_factory=list)
     result_directory: str = ""
     scenario_directory: str = ""
-    gateway_planning_enabled: bool = True
-    gateway_min_sites: int = 3
-    gateway_max_sites: int = 5
-    gateway_redundancy: int = 2
+    gateway_planning_enabled: bool = False
+    gateway_min_sites: int = 5
+    gateway_max_sites: int = 12
+    gateway_redundancy: int = 1
     gateway_max_antennas: int = 20
-    gateway_planning_mode: str = "automatic"
-    planning_horizon_s: float = 1200.0
-    planning_slot_s: float = 15.0
+    gateway_planning_mode: str = "specified"
+    planning_horizon_s: float = 1800.0
+    planning_slot_s: float = 300.0
     fast_evaluation_period_s: float = 1.0
-    fast_adjust_period_s: float = 5.0
+    fast_adjust_period_s: float = 1.0
     route_update_period_s: float = 15.0
     planning_freeze_window_s: float = 30.0
     traffic_landing_percent: float = 30.0
+    geo_satellite_count: int = 3
+    geo_center_longitude_deg: float = 110.0
+    geo_longitude_spacing_deg: float = 30.0
+    geo_altitude_km: float = 35786.0
+    gso_i_over_n_db: float = -12.0
+    gso_protection_angle_deg: float = 10.0
+    planning_capacity_reserve_percent: float = 20.0
+    priority_task_regions: list[dict] = field(default_factory=list)
+    planning_capacity_weight: float = 0.0  # Deprecated; kept for old scenario files.
+    planning_delay_weight: float = 0.0  # Zero/zero selects capacity-then-delay ordering.
+    # Reference feeder downlink assumptions; replace with hardware data when available.
+    feeder_frequency_ghz: float = 39.0
+    feeder_rolloff: float = 0.20
+    satellite_eirp_dbw: float = 26.0
+    planning_selection_strategy: str = "legacy"
+

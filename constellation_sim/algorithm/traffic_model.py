@@ -61,11 +61,11 @@ class TrafficModelConfig:
     # Dense-cell and access-association policy.
     dense_percentile: float = 95.0
     dense_absolute_weight: float = 0.0
-    normal_max_satellites: int = 1
-    dense_max_satellites: int = 3
+    normal_max_satellites: int = 2
+    dense_max_satellites: int = 4
     dense_cluster_radius_km: float = 180.0
     dense_cluster_min_cells: int = 2
-    min_elevation_deg: float = 30.0
+    min_elevation_deg: float = 20.0
     elevation_score_weight: float = 0.55
     load_balance_score_weight: float = 0.45
 
@@ -263,8 +263,11 @@ class TrafficModel:
             return CellAllocation(cell.cell_id, demand[cell.cell_id], hours[cell.cell_id], dense,
                                   len(visibility.get(cell.cell_id, ())), dense_cluster_id=cluster_id)
 
-        # Allocate each dense cluster across a shared satellite pool. Each cell
-        # keeps one primary access satellite; cooperation happens across cells.
+        # Allocate each dense cluster across a shared satellite pool.  A cell
+        # represents many terminals, so its aggregate traffic may be shared by
+        # a small number of simultaneously visible access satellites.  This
+        # prevents one grid cell from creating an impossible egress bottleneck
+        # when every business satellite is limited to two feeder exits.
         for cluster_id, cells in sorted(enumerate(clusters), key=lambda item: -sum(demand[c.cell_id] for c in item[1])):
             candidate_stats: dict[int, list[float]] = {}
             for cell in cells:
@@ -286,9 +289,10 @@ class TrafficModel:
                         diversity = 1.0 if max_count <= 0 else 1.0 - cluster_counts[item.satellite_id] / max_count
                         return (cfg.elevation_score_weight * self._quality(item, cfg.min_elevation_deg)
                                 + cfg.load_balance_score_weight * diversity)
-                    selected = max(candidates, key=cluster_score)
-                    allocation.allocations = {selected.satellite_id: allocation.demand_weight}
-                    cluster_counts[selected.satellite_id] += 1
+                    selected = sorted(candidates,key=cluster_score,reverse=True)[:min(4,len(candidates))]
+                    share=allocation.demand_weight/len(selected)
+                    allocation.allocations = {item.satellite_id: share for item in selected}
+                    for item in selected:cluster_counts[item.satellite_id] += 1
                 else:
                     allocation.unassigned_weight = allocation.demand_weight
                 for sid, assigned in allocation.allocations.items():
@@ -320,8 +324,9 @@ class TrafficModel:
 
             allocation = make_allocation(cell, False, -1)
             if candidates:
-                selected = max(candidates, key=score)
-                allocation.allocations = {selected.satellite_id: cell_demand}
+                selected=sorted(candidates,key=score,reverse=True)[:min(max(1,cfg.normal_max_satellites),len(candidates))]
+                share=cell_demand/len(selected)
+                allocation.allocations = {item.satellite_id: share for item in selected}
             else:
                 allocation.unassigned_weight = cell_demand
             for sid, assigned in allocation.allocations.items():

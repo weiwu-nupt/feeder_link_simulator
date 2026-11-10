@@ -27,17 +27,27 @@ class ResultStore:
             self.metadata={};self.db=sqlite3.connect(str(self.path),check_same_thread=False);self.db.execute("PRAGMA journal_mode=WAL");self.db.execute("PRAGMA synchronous=NORMAL")
 
     def _save_metadata(self):
-        temporary=self.metadata_path.with_suffix(".tmp");temporary.write_text(json.dumps(self.metadata,ensure_ascii=False,indent=2),encoding="utf-8");temporary.replace(self.metadata_path)
+        temporary=self.metadata_path.with_suffix(".tmp");temporary.write_text(json.dumps(self.metadata,ensure_ascii=False,separators=(',',':')),encoding="utf-8");temporary.replace(self.metadata_path)
 
     def set_metadata(self,key,value):
         if self.directory_mode:
+            if key=="offline_plans":
+                # 离线方案包含大量逐路由数据。若嵌入metadata，每新增一个
+                # 30帧分片都要重新序列化十余MB，周期性占用GIL并卡住界面。
+                filename="offline_plans.json";temporary=(self.path/filename).with_suffix(".tmp")
+                temporary.write_text(json.dumps(value,ensure_ascii=False,separators=(',',':')),encoding="utf-8");temporary.replace(self.path/filename)
+                self.metadata["offline_plans_file"]=filename;self.metadata.pop("offline_plans",None);self._save_metadata();return
             self.metadata[key]=value
             if key=="config":(self.path/"config_snapshot.json").write_text(json.dumps(value,ensure_ascii=False,indent=2),encoding="utf-8")
             self._save_metadata();return
         self.db.execute("CREATE TABLE IF NOT EXISTS metadata(key TEXT PRIMARY KEY,value TEXT NOT NULL)");self.db.execute("INSERT OR REPLACE INTO metadata(key,value) VALUES(?,?)",(key,json.dumps(value,ensure_ascii=False,separators=(',',':'))));self.db.commit()
 
     def get_metadata(self,key,default=None):
-        if self.directory_mode:return self.metadata.get(key,default)
+        if self.directory_mode:
+            if key=="offline_plans" and key not in self.metadata:
+                path=self.path/self.metadata.get("offline_plans_file","offline_plans.json")
+                if path.is_file():return json.loads(path.read_text(encoding="utf-8"))
+            return self.metadata.get(key,default)
         row=self.db.execute("SELECT value FROM metadata WHERE key=?",(key,)).fetchone();return json.loads(row[0]) if row else default
 
     def _chunk_path(self,chunk_id):
@@ -51,7 +61,10 @@ class ResultStore:
         if self.chunk_id==chunk_id:return
         if self.chunk_db is not None:self.chunk_db.commit();self.chunk_db.close()
         self.chunk_id=chunk_id;chunk_path=self._chunk_path(chunk_id);self.chunk_db=sqlite3.connect(str(chunk_path),check_same_thread=False);self._configure_chunk(self.chunk_db)
-        if chunk_path.name not in self.metadata["chunks"]:self.metadata["chunks"].append(chunk_path.name);self.metadata["chunks"].sort();self._save_metadata()
+        if chunk_path.name not in self.metadata["chunks"]:
+            self.metadata["chunks"].append(chunk_path.name);self.metadata["chunks"].sort()
+            # 每10个分片更新一次索引；结束时_writer_loop会完整写回。
+            if len(self.metadata["chunks"])%10==0:self._save_metadata()
 
     def write_frame(self,frame):
         blob=frame.get("_result_blob")

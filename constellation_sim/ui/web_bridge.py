@@ -7,7 +7,8 @@ class MapBridge(QObject):
     plane_filter_changed = Signal(int,int)
     viewport_changed = Signal(float,float,float,float)
     traffic_details_requested = Signal(str)
-    satellite_path_requested = Signal(int)
+    satellite_path_requested = Signal(int,int)
+    satellite_exit_comparison_requested = Signal(int,int)
     input_view_changed = Signal(str)
 
     @Slot(int,int)
@@ -22,9 +23,13 @@ class MapBridge(QObject):
     def requestTrafficDetails(self,cell_id):
         self.traffic_details_requested.emit(cell_id)
 
-    @Slot(int)
-    def requestSatellitePath(self,satellite_id):
-        self.satellite_path_requested.emit(satellite_id)
+    @Slot(int,int)
+    def requestSatellitePath(self,satellite_id,frame_index):
+        self.satellite_path_requested.emit(satellite_id,frame_index)
+
+    @Slot(int,int)
+    def requestSatelliteComparison(self,satellite_id,frame_index):
+        self.satellite_exit_comparison_requested.emit(satellite_id,frame_index)
 
     @Slot(str)
     def setInputView(self,mode):
