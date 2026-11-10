@@ -65,6 +65,15 @@ RAIN_GRADE_SPATIAL_PROFILES={
     "重雨": {"radius_km":620.,"background":.16,"peak":1.00},
 }
 
+_SCENARIO_SPATIAL_CACHE={}
+
+
+def install_scenario_spatial_cache(rows):
+    """Install station/grade/slot factors from the independent rain asset."""
+    global _SCENARIO_SPATIAL_CACHE
+    _SCENARIO_SPATIAL_CACHE={(round(float(lat),6),round(float(lon),6),str(grade),int(slot)):float(value)
+                             for lat,lon,grade,slot,value in rows}
+
 
 def _surface_distance_km(lat1,lon1,lat2,lon2):
     p1,p2=math.radians(lat1),math.radians(lat2);dp=p2-p1;dl=math.radians(lon2-lon1)
@@ -87,6 +96,9 @@ def _scenario_storm_centres(time_s):
 def scenario_spatial_factor(station,rain_grade,time_s=0.):
     profile=RAIN_GRADE_SPATIAL_PROFILES.get(str(rain_grade),RAIN_GRADE_SPATIAL_PROFILES["中雨"])
     lat=float(station.get("lat",0));lon=float(station.get("lon",0));radius=max(1.,float(profile["radius_km"]))
+    key=(round(lat,6),round(lon,6),str(rain_grade),max(0,int(float(time_s)//300.)))
+    cached=_SCENARIO_SPATIAL_CACHE.get(key)
+    if cached is not None:return cached
     influence=max(math.exp(-.5*(_surface_distance_km(lat,lon,c_lat,c_lon)/radius)**2) for c_lat,c_lon in _scenario_storm_centres(time_s))
     background=max(0.,min(1.,float(profile["background"])));peak=max(background,min(1.,float(profile["peak"])))
     return round(background+(peak-background)*influence,6)
