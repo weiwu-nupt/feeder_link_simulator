@@ -64,7 +64,7 @@ from constellation_sim.ui.web_bridge import MapBridge
 from constellation_sim.algorithm.traffic_model import TrafficCell, TrafficModel, TrafficModelConfig, calculate_visibility
 from constellation_sim.algorithm.traffic_preprocess import load_cells_csv
 from constellation_sim.algorithm.planning import SlowFastLoopPlanner, PlannerConfig, DEFAULT_MODCOD_TABLE, load_modcod_table, _graph, link_state, _slant_distance_km
-from constellation_sim.algorithm.rain_model import scenario_attenuation_db
+from constellation_sim.algorithm.rain_model import scenario_attenuation_db, scenario_spatial_factor, install_scenario_spatial_cache, RAIN_GRADE_SPATIAL_PROFILES
 from feeder_integration import create_calculation_pages, create_simulation_pages
 
 
@@ -72,6 +72,14 @@ EARTH_RADIUS_M = 6_378_135.0
 EARTH_FLATTENING = 1.0 / 298.26
 MU = 3.986004418e14
 DIAGNOSTIC_LOG_LOCK = threading.Lock()
+
+
+def file_content_hash(path):
+    digest=hashlib.sha256()
+    with Path(path).open("rb") as stream:
+        for chunk in iter(lambda:stream.read(1024*1024),b""):
+            digest.update(chunk)
+    return digest.hexdigest()
 
 
 def append_diagnostic(path, event, **fields):
@@ -668,6 +676,10 @@ class PlanningEvaluationWidget(QWidget):
         conclusion="满足" if service>=.99 else ("基本满足" if service>=.9 else "需优化")
         gap_reason=_delivery_gap_reason(active,demand,delivered,route)
         self.summary.setText(f"{scope} · 需求 {demand:.3f} Gb/s　送达 {delivered:.3f} Gb/s　未送达 {unserved:.3f} Gb/s　送达率 {service*100:.1f}%\n主要原因：{gap_reason}\n时延：加权平均 {metrics['average_delay_ms']:.3f} ms　P95 {metrics['p95_delay_ms']:.3f} ms　最大 {metrics['maximum_delay_ms']:.3f} ms")
+        if gid is None and float(context.get("priority_demand_gbps",0))>0:
+            priority_demand=float(context["priority_demand_gbps"])
+            priority_delivered=min(priority_demand,float(context.get("priority_delivered_gbps",0)))
+            self.summary.setText(self.summary.text()+f"\n重点区域业务：需求 {priority_demand:.3f} Gb/s　送达 {priority_delivered:.3f} Gb/s　送达率 {100*priority_delivered/priority_demand:.1f}%　平均路径时延 {float(context.get('priority_average_delay_ms',0)):.3f} ms")
         if rebuild_history:self.chart.clear();self.delay_chart.clear();self.events.setRowCount(0)
         history=self.frame_history if rebuild_history else ([self.frame_history[-1]] if append_history and self.frame_history else [])
         for event in history:
@@ -864,6 +876,19 @@ def compute_traffic_rows(traffic_model,traffic_cells,positions,min_elevation_deg
     satellite_rows=[[sid,load.assigned_weight,load.served_cell_count] for sid,load in result.satellites.items() if load.assigned_weight>0.0]
     return rows,satellite_rows,round((time.perf_counter()-started)*1000,1)
 
+def priority_traffic_by_satellite(traffic_rows,regions):
+    """Identify priority traffic by its ground-cell origin, not satellite position."""
+    if not regions:return {}
+    from constellation_sim.algorithm.planning import _surface_distance_km
+    loads={}
+    for row in traffic_rows:
+        if not any(_surface_distance_km(float(row[1]),float(row[2]),float(region['lat']),float(region['lon']))<=float(region['radius_km']) for region in regions):
+            continue
+        for satellite,amount in row[6]:
+            satellite=int(satellite)
+            loads[satellite]=loads.get(satellite,0.)+float(amount)
+    return loads
+
 def read_traffic_cache_frame(source,frame_index):
     started=time.perf_counter()
     if isinstance(source,(list,tuple)):
@@ -937,6 +962,20 @@ class SimulationWorker(QObject):
                     raise ValueError("单壳层Walker卫星总数必须能被轨道面数量整除")
                 shells=cfg.walker_shells if cfg.walker_mode in ("multi_shell","document_4_shell") and cfg.walker_shells else [{"name":"L1","altitude_km":cfg.altitude_km,"inclination_deg":cfg.inclination_deg,"planes":cfg.planes,"per_plane":cfg.satellite_count//cfg.planes}]
                 cfg.satellite_count=sum(int(x["planes"])*int(x["per_plane"]) for x in shells);cfg.planes=sum(int(x["planes"]) for x in shells)
+                constellation_spec={"cache_version":1,"shells":shells,"layout":cfg.walker_layout,
+                                    "eccentricity":cfg.eccentricity,"arg_perigee_deg":cfg.arg_perigee_deg}
+                constellation_key=hashlib.sha256(json.dumps(constellation_spec,sort_keys=True,ensure_ascii=False,separators=(",",":")).encode("utf-8")).hexdigest()[:24]
+                constellation_root=ROOT/"simulation_cache"/"constellation";constellation_root.mkdir(parents=True,exist_ok=True)
+                constellation_path=constellation_root/f"{constellation_key}.tles"
+                cached_tle_records=[];cached_satellites=[];cached_epoch=None;constellation_cache_reused=False
+                if constellation_path.is_file():
+                    try:
+                        cached_tle_records=read_tle_records(constellation_path)[0]
+                        if len(cached_tle_records)==cfg.satellite_count:
+                            if not analytic_walker:cached_satellites,cached_epoch,_,_=read_tle_file(constellation_path)
+                            constellation_cache_reused=analytic_walker or len(cached_satellites)==cfg.satellite_count
+                    except (OSError,ValueError,TypeError):pass
+                if not constellation_cache_reused:cached_tle_records=[];cached_satellites=[]
                 per_plane=int(shells[0]["per_plane"]);satellites=[];satellite_planes=[];satellite_slots=[];satellite_shells=[];satellite_labels=[];shell_runs=[]
                 method="向量化圆轨道参数" if analytic_walker else "Walker TLE"
                 self.progress.emit(10, f"准备阶段 2/4：正在生成 {cfg.satellite_count:,} 颗卫星的{method}")
@@ -956,7 +995,9 @@ class SimulationWorker(QObject):
                                     phase=2*math.pi*(slot/shell_per_plane+local_plane/(shell_planes*shell_per_plane))
                                     analytic_params.append((semi_major_m,math.radians(inclination),raan,phase,angular_rate))
                                     label=f"{shell.get('name',f'L{shell_index+1}')}-P{local_plane+1:03d}-S{slot+1:03d}"
-                                    tle_records.append(_analytic_tle_record(label,sat_offset+local_plane*shell_per_plane+slot+1,inclination,math.degrees(raan),math.degrees(phase),mean_motion))
+                                    if not constellation_cache_reused:tle_records.append(_analytic_tle_record(label,sat_offset+local_plane*shell_per_plane+slot+1,inclination,math.degrees(raan),math.degrees(phase),mean_motion))
+                        elif constellation_cache_reused:
+                            shell_sats=cached_satellites[sat_offset:sat_offset+shell_planes*shell_per_plane];shell_epoch=cached_epoch
                         else:
                             tle_path=Path(tmp)/f"walker_shell_{shell_index+1}.tles"
                             satgen.generate_tles_from_scratch_manual(str(tle_path),f"QT-{shell.get('name',shell_index+1)}",shell_planes,shell_per_plane,False,inclination,cfg.eccentricity,cfg.arg_perigee_deg,mean_motion,180.0 if cfg.walker_layout=="star" else 360.0)
@@ -968,6 +1009,7 @@ class SimulationWorker(QObject):
                             satellite_shells.extend([shell_index]*shell_per_plane)
                         shell_runs.append({**shell,"satellite_offset":sat_offset,"plane_offset":plane_offset});sat_offset+=len(shell_sats);plane_offset+=shell_planes;perigees.append(perigee);apogees.append(apogee)
                     perigee_altitude_km=min(perigees);apogee_altitude_km=max(apogees)
+                if constellation_cache_reused:tle_records=cached_tle_records
             else:
                 self.progress.emit(10, "准备阶段 2/4：正在读取并解析TLE文件")
                 satellites, epoch, file_planes, file_per_plane = read_tle_file(Path(cfg.tle_path))
@@ -986,11 +1028,18 @@ class SimulationWorker(QObject):
             if len(tle_records)!=len(satellites):raise ValueError("卫星 TLE 数量与轨道对象数量不一致")
             tle_asset=Path(cfg.scenario_directory)/"base_data"/"satellites.tles"
             tle_asset.parent.mkdir(parents=True,exist_ok=True)
-            temporary_tle=tle_asset.with_suffix(".building.tles")
-            tle_header=[f"{cfg.planes} {len(satellites)//cfg.planes}"] if len(satellites)%cfg.planes==0 and all(int(shell["per_plane"])==len(satellites)//cfg.planes for shell in shell_runs) else []
-            temporary_tle.write_text("\n".join((*tle_header,*(line for record in tle_records for line in record)))+"\n",encoding="utf-8")
-            temporary_tle.replace(tle_asset)
+            if cfg.source=="walker" and constellation_cache_reused:
+                if tle_asset!=constellation_path:shutil.copy2(constellation_path,tle_asset)
+            else:
+                temporary_tle=tle_asset.with_suffix(".building.tles")
+                tle_header=[f"{cfg.planes} {len(satellites)//cfg.planes}"] if len(satellites)%cfg.planes==0 and all(int(shell["per_plane"])==len(satellites)//cfg.planes for shell in shell_runs) else []
+                temporary_tle.write_text("\n".join((*tle_header,*(line for record in tle_records for line in record)))+"\n",encoding="utf-8")
+                temporary_tle.replace(tle_asset)
+            if cfg.source=="walker" and not constellation_cache_reused:shutil.copy2(tle_asset,constellation_path)
             tle_asset_hash=hashlib.sha256(tle_asset.read_bytes()).hexdigest()
+            shared_tle_root=ROOT/"simulation_cache"/"tle";shared_tle_root.mkdir(parents=True,exist_ok=True)
+            shared_tle_asset=shared_tle_root/f"{tle_asset_hash[:24]}.tles"
+            if not shared_tle_asset.is_file():shutil.copy2(tle_asset,shared_tle_asset)
             self.progress.emit(45, f"准备阶段 2/4完成：已建立 {len(satellites):,} 个轨道传播对象")
             traffic_cells = []
             traffic_model = None
@@ -1036,10 +1085,27 @@ class SimulationWorker(QObject):
             if cfg.seam_enabled and not 0 <= cfg.seam_after_plane < cfg.planes:
                 raise ValueError(f"缝隙起始轨道面必须在1到{cfg.planes}之间")
             self.progress.emit(55, f"准备阶段 3/4：正在生成{('3-ISL固定砖墙' if cfg.isl_pattern == '3isl_brick' else '4-ISL规则网格')}候选")
-            candidates=[];seam_candidates=[]
-            for shell in shell_runs:
-                local,local_seams=make_candidates(int(shell["planes"]),int(shell["per_plane"]),cfg.isl_pattern,cfg.seam_enabled,int(shell["planes"])-1)
-                offset=int(shell["satellite_offset"]);candidates.extend((a+offset,b+offset,k) for a,b,k in local);seam_candidates.extend((a+offset,b+offset,k) for a,b,k in local_seams)
+            import numpy as np
+            cache_root=ROOT/"simulation_cache";cache_root.mkdir(parents=True,exist_ok=True)
+            topology_spec={"cache_version":1,"shells":[[int(shell["planes"]),int(shell["per_plane"]),int(shell["satellite_offset"])] for shell in shell_runs],
+                           "isl_pattern":cfg.isl_pattern,"seam_enabled":cfg.seam_enabled}
+            topology_key=hashlib.sha256(json.dumps(topology_spec,sort_keys=True,separators=(",",":")).encode("utf-8")).hexdigest()[:24]
+            topology_root=cache_root/"topology";topology_root.mkdir(parents=True,exist_ok=True)
+            topology_path=topology_root/f"{topology_key}.npz";topology_cache_reused=False
+            if topology_path.is_file():
+                try:
+                    with np.load(topology_path) as stored_topology:
+                        candidates=stored_topology["candidates"].tolist();seam_candidates=stored_topology["seams"].tolist()
+                    topology_cache_reused=True
+                except (OSError,ValueError,KeyError):topology_cache_reused=False
+            if not topology_cache_reused:
+                candidates=[];seam_candidates=[]
+                for shell in shell_runs:
+                    local,local_seams=make_candidates(int(shell["planes"]),int(shell["per_plane"]),cfg.isl_pattern,cfg.seam_enabled,int(shell["planes"])-1)
+                    offset=int(shell["satellite_offset"]);candidates.extend((a+offset,b+offset,k) for a,b,k in local);seam_candidates.extend((a+offset,b+offset,k) for a,b,k in local_seams)
+                temporary_topology=topology_path.with_suffix(".building.npz")
+                np.savez_compressed(temporary_topology,candidates=np.asarray(candidates,dtype=np.int64).reshape(-1,3),seams=np.asarray(seam_candidates,dtype=np.int64).reshape(-1,3))
+                temporary_topology.replace(topology_path)
             if any(satellite_shells[a]!=satellite_shells[b] for a,b,_kind in candidates+seam_candidates):
                 raise RuntimeError("ISL候选生成错误：检测到跨壳层链路")
             expected_same=sum(int(shell["planes"])*int(shell["per_plane"]) for shell in shell_runs)
@@ -1048,7 +1114,6 @@ class SimulationWorker(QObject):
                 raise RuntimeError(f"同轨ISL候选不完整：应为 {expected_same} 条，实际 {actual_same} 条")
             diagnostic_path=str(Path(cfg.result_directory)/"time_variation.jsonl") if cfg.result_directory else ""
             append_diagnostic(diagnostic_path,"isl_candidates",shell_count=len(shell_runs),same_candidates=actual_same,cross_candidates=sum(kind==1 for _a,_b,kind in candidates),seam_candidates=len(seam_candidates),cross_shell_candidates=0)
-            import numpy as np
             candidate_array=np.asarray(candidates,dtype=np.int64) if candidates else np.empty((0,3),dtype=np.int64)
             modcod_table = load_modcod_table(cfg.modcod_table_path) if cfg.planning_enabled else DEFAULT_MODCOD_TABLE
             planner = SlowFastLoopPlanner(cfg.stations, PlannerConfig(
@@ -1091,28 +1156,30 @@ class SimulationWorker(QObject):
             if not 0 <= cfg.center_plane < cfg.planes:
                 raise ValueError(f"中心轨道面必须在 1 到 {cfg.planes} 之间")
             total_frames = max(1, int(math.floor(cfg.duration_s / cfg.step_s)) + 1)
-            orbit_cache=None;orbit_cache_path="";cache_key="";orbit_cache_bytes=total_frames*len(satellites)*6*4
+            orbit_cache=None;orbit_cache_path="";orbit_cache_reused=False;cache_key="";orbit_cache_bytes=total_frames*len(satellites)*6*4
             cache_limit_bytes=1024*1024*1024
-            if orbit_cache_bytes<=cache_limit_bytes:
+            # Keep an on-disk orbit cache even when it is too large to load
+            # into RAM.  A memory map avoids recomputing the orbit and also
+            # lets dependent traffic and gateway stages reuse their own cache.
+            if total_frames and satellites:
                 import numpy as np
-                cache_owner=cfg.scenario_directory or cfg.result_directory
-                cache_root=(Path(cache_owner)/"base_data") if cache_owner else (Path(__file__).with_name("cache")/"orbit");cache_root.mkdir(parents=True,exist_ok=True)
+                # Content-addressed stage assets live outside the full-scenario
+                # directory, so unrelated parameter edits can reuse them.
                 tle_signature=""
                 if cfg.source=="tle" and Path(cfg.tle_path).is_file():
-                    stat=Path(cfg.tle_path).stat();tle_signature=f"{Path(cfg.tle_path).resolve()}:{stat.st_size}:{stat.st_mtime_ns}"
+                    tle_signature=file_content_hash(cfg.tle_path)
                 cache_spec={"cache_version":2,"source":cfg.source,"tle":tle_signature,"shells":cfg.walker_shells,"count":len(satellites),"planes":cfg.planes,"layout":cfg.walker_layout,"altitude":cfg.altitude_km,"inclination":cfg.inclination_deg,"eccentricity":cfg.eccentricity,"arg_perigee":cfg.arg_perigee_deg,"duration":cfg.duration_s,"step":cfg.step_s}
                 cache_key=hashlib.sha256(json.dumps(cache_spec,sort_keys=True,ensure_ascii=False).encode("utf-8")).hexdigest()[:24]
-                cache_file=(cache_root/"orbit_positions.npy") if cfg.scenario_directory else (cache_root/f"{cache_key}.npy");meta_file=(cache_root/"orbit_positions.json") if cfg.scenario_directory else (cache_root/f"{cache_key}.json")
+                orbit_root=cache_root/"orbit";orbit_root.mkdir(parents=True,exist_ok=True)
+                cache_file=orbit_root/f"{cache_key}.npy";meta_file=orbit_root/f"{cache_key}.json"
                 if cache_file.is_file() and meta_file.is_file():
                     try:
                         meta=json.loads(meta_file.read_text(encoding="utf-8"))
                         if (meta.get("shape")==[total_frames,len(satellites),6]
                                 and meta.get("dtype")=="float32"
                                 and meta.get("spec")==cache_spec):
-                            # The accepted cache already fits the configured RAM
-                            # budget. Load it eagerly so a random OS page fault
-                            # cannot stall an otherwise real-time frame for seconds.
-                            orbit_cache=np.load(cache_file);orbit_cache_path=str(cache_file)
+                            orbit_cache=np.load(cache_file,mmap_mode="r" if orbit_cache_bytes>cache_limit_bytes else None)
+                            orbit_cache_path=str(cache_file);orbit_cache_reused=True
                     except Exception:orbit_cache=None
                 if orbit_cache is None:
                     self.progress.emit(82,f"准备阶段 4/4：预计算 {total_frames:,} 帧轨道位置（约 {orbit_cache_bytes/1024/1024:.0f} MB）")
@@ -1134,8 +1201,21 @@ class SimulationWorker(QObject):
                         if cache_index%max(1,total_frames//50)==0:self.progress.emit(82+round(15*(cache_index+1)/total_frames),f"准备阶段 4/4：轨道缓存 {cache_index+1:,}/{total_frames:,} 帧")
                     orbit_cache.flush();del orbit_cache
                     if cache_file.exists():cache_file.unlink()
-                    temporary.replace(cache_file);meta_file.write_text(json.dumps({"shape":[total_frames,len(satellites),6],"dtype":"float32","spec":cache_spec},ensure_ascii=False),encoding="utf-8");orbit_cache=np.load(cache_file);orbit_cache_path=str(cache_file)
-            traffic_cache_connection=None;traffic_cache_blobs=None;traffic_cache_path="";traffic_cache_reused=False;traffic_key="";compressed_bytes=0;traffic_update_period_s=30.0;traffic_keyframe_count=0
+                    temporary.replace(cache_file);meta_file.write_text(json.dumps({"shape":[total_frames,len(satellites),6],"dtype":"float32","spec":cache_spec},ensure_ascii=False),encoding="utf-8");orbit_cache=np.load(cache_file,mmap_mode="r" if orbit_cache_bytes>cache_limit_bytes else None);orbit_cache_path=str(cache_file)
+            isl_model_spec={"cache_version":1,"topology_key":topology_key,"orbit_key":cache_key,
+                            "max_isl_km":cfg.max_isl_km,"latitude_limit_deg":cfg.latitude_limit_deg,
+                            "seam_after_plane":cfg.seam_after_plane,"walker_layout":cfg.walker_layout}
+            isl_model_key=hashlib.sha256(json.dumps(isl_model_spec,sort_keys=True,separators=(",",":")).encode("utf-8")).hexdigest()[:24]
+            isl_model_root=cache_root/"isl_model";isl_model_root.mkdir(parents=True,exist_ok=True)
+            isl_model_file=isl_model_root/f"{isl_model_key}.json";isl_model_reused=False
+            if isl_model_file.is_file():
+                try:isl_model_reused=json.loads(isl_model_file.read_text(encoding="utf-8")).get("spec")==isl_model_spec
+                except (OSError,ValueError,TypeError):pass
+            if not isl_model_reused:
+                temporary_isl=isl_model_file.with_suffix(".building.json")
+                temporary_isl.write_text(json.dumps({"spec":isl_model_spec},ensure_ascii=False,separators=(",",":")),encoding="utf-8")
+                temporary_isl.replace(isl_model_file)
+            traffic_cache_connection=None;traffic_cache_blobs=None;traffic_cache_path="";traffic_cache_reused=False;traffic_key="";traffic_source_signature="";compressed_bytes=0;traffic_update_period_s=30.0;traffic_keyframe_count=0
             if traffic_model is not None and orbit_cache is not None:
                 traffic_update_period_s=30.0
                 traffic_stride=max(1,int(math.ceil(traffic_update_period_s/cfg.step_s)))
@@ -1144,9 +1224,11 @@ class SimulationWorker(QObject):
                 traffic_keyframe_count=len(traffic_keyframes)
                 traffic_source_signature=""
                 if cfg.traffic_grid_path and Path(cfg.traffic_grid_path).is_file():
-                    traffic_stat=Path(cfg.traffic_grid_path).stat();traffic_source_signature=f"{Path(cfg.traffic_grid_path).resolve()}:{traffic_stat.st_size}:{traffic_stat.st_mtime_ns}"
+                    traffic_source_signature=file_content_hash(cfg.traffic_grid_path)
                 traffic_spec={"cache_version":3,"access_split_policy":"normal2_dense4","orbit_key":cache_key,"grid":traffic_source_signature,"cells":len(traffic_cells),"outside_china_percent":cfg.traffic_outside_china_percent,"min_elevation":cfg.min_elevation_deg,"dense_percentile":cfg.traffic_dense_percentile,"dense_max_satellites":cfg.traffic_dense_max_satellites,"random_sigma":cfg.traffic_random_sigma,"total_gbps":cfg.traffic_total_gbps,"cluster_radius":cfg.traffic_cluster_radius_km,"frames":total_frames,"step":cfg.step_s,"update_period_s":traffic_update_period_s,"keyframes":traffic_keyframes}
-                traffic_key=hashlib.sha256(json.dumps(traffic_spec,sort_keys=True,ensure_ascii=False).encode("utf-8")).hexdigest()[:24];traffic_file=(cache_root/"traffic_timeseries.sqlite") if cfg.scenario_directory else (cache_root/f"{traffic_key}.traffic.sqlite");traffic_cache_path=str(traffic_file)
+                traffic_key=hashlib.sha256(json.dumps(traffic_spec,sort_keys=True,ensure_ascii=False).encode("utf-8")).hexdigest()[:24]
+                traffic_root=cache_root/"traffic";traffic_root.mkdir(parents=True,exist_ok=True)
+                traffic_file=traffic_root/f"{traffic_key}.sqlite";traffic_cache_path=str(traffic_file)
                 traffic_cache_connection=sqlite3.connect(str(traffic_file),check_same_thread=False);traffic_cache_connection.execute("PRAGMA journal_mode=WAL");traffic_cache_connection.execute("PRAGMA synchronous=NORMAL");traffic_cache_connection.execute("CREATE TABLE IF NOT EXISTS metadata(key TEXT PRIMARY KEY,value TEXT NOT NULL)");traffic_cache_connection.execute("CREATE TABLE IF NOT EXISTS frames(frame_index INTEGER PRIMARY KEY,blob BLOB NOT NULL)")
                 encoded_spec=json.dumps(traffic_spec,sort_keys=True,ensure_ascii=False,separators=(",",":"))
                 stored=traffic_cache_connection.execute("SELECT value FROM metadata WHERE key='spec'").fetchone();count=traffic_cache_connection.execute("SELECT COUNT(*) FROM frames").fetchone()[0]
@@ -1186,7 +1268,7 @@ class SimulationWorker(QObject):
                             if next_key_index<len(traffic_keyframes) and frame_index>=traffic_keyframes[next_key_index]:active_key=traffic_keyframes[next_key_index];next_key_index+=1
                             traffic_cache_blobs[frame_index]=decoded_keyframes[active_key]
             gateway_deployment={"status":"使用手动设置资源","algorithm":"手动设置","mode":"specified","station_count":len(cfg.stations),"planned_stations":cfg.stations,"stations":[]}
-            gateway_cache_reused=False
+            gateway_cache_reused=False;gateway_key="";deployment_path=None
             if cfg.gateway_planning_enabled or cfg.gateway_planning_mode=="automatic":
                 representative_rates=sorted(float(row.rate_gbps) if row.rate_gbps is not None else cfg.feeder_bandwidth_mhz*float(row.spectral_efficiency)/1000.0 for row in modcod_table)
                 representative_channel_rate=representative_rates[len(representative_rates)//2] if representative_rates else cfg.feeder_bandwidth_mhz/1000.0
@@ -1199,16 +1281,16 @@ class SimulationWorker(QObject):
                     planning_demand=max((sum(float(row[1]) for row in read_traffic_cache_frame(traffic_source,index)[1]) for index in demand_samples),default=cfg.traffic_total_gbps)*cfg.traffic_landing_percent/100.0
                 capacity_target=planning_demand*(1.0+max(0.0,cfg.planning_capacity_reserve_percent)/100.0)
                 gateway_spec={"cache_version":12,"algorithm_version":14,"orbit_key":cache_key,"traffic_key":traffic_key,
-                    "orbit":{"source":cfg.source,"tle_path":cfg.tle_path,"shells":cfg.walker_shells,"count":len(satellites),"planes":cfg.planes,
+                    "orbit":{"source":cfg.source,"shells":cfg.walker_shells,"count":len(satellites),"planes":cfg.planes,
                         "layout":cfg.walker_layout,"altitude_km":cfg.altitude_km,"inclination_deg":cfg.inclination_deg,
                         "eccentricity":cfg.eccentricity,"arg_perigee_deg":cfg.arg_perigee_deg,"duration_s":cfg.duration_s,"step_s":cfg.step_s},
                     "mode":cfg.gateway_planning_mode,"specified_stations":cfg.stations if cfg.gateway_planning_mode=="specified" else [],
                     "min_elevation_deg":cfg.min_elevation_deg,"max_gsl_km":cfg.max_gsl_km,
                     "minimum_sites":cfg.gateway_min_sites,"maximum_sites":cfg.gateway_max_sites,"redundancy":cfg.gateway_redundancy,"maximum_antennas":cfg.gateway_max_antennas,
-                    "feeder_bandwidth_mhz":cfg.feeder_bandwidth_mhz,"feeder_frequency_ghz":cfg.feeder_frequency_ghz,"feeder_rolloff":cfg.feeder_rolloff,"satellite_eirp_dbw":cfg.satellite_eirp_dbw,"gateway_gt_dbk":cfg.gateway_gt_dbk,"gateway_array_loss_db":cfg.gateway_array_loss_db,"modcod_table":[[row.name,row.minimum_snr_db,row.spectral_efficiency,row.rate_gbps] for row in modcod_table],
+                    "feeder_bandwidth_mhz":cfg.feeder_bandwidth_mhz,"feeder_frequency_ghz":cfg.feeder_frequency_ghz,"feeder_rolloff":cfg.feeder_rolloff,"satellite_eirp_dbw":cfg.satellite_eirp_dbw,"gateway_gt_dbk":cfg.gateway_gt_dbk,"gateway_array_loss_db":cfg.gateway_array_loss_db,"snr_margin_db":cfg.snr_margin_db,"modcod_table":[[row.name,row.minimum_snr_db,row.spectral_efficiency,row.rate_gbps] for row in modcod_table],
                     "geo_interference":{"enabled":cfg.geo_interference_enabled,"satellite_count":cfg.geo_satellite_count,"center_longitude_deg":cfg.geo_center_longitude_deg,
                         "longitude_spacing_deg":cfg.geo_longitude_spacing_deg,"altitude_km":cfg.geo_altitude_km,"i_over_n_db":cfg.gso_i_over_n_db,"protection_angle_deg":cfg.gso_protection_angle_deg},
-                    "traffic":{"enabled":cfg.traffic_enabled,"grid_path":cfg.traffic_grid_path,"outside_china_percent":cfg.traffic_outside_china_percent,
+                    "traffic":{"enabled":cfg.traffic_enabled,"grid_hash":traffic_source_signature,"outside_china_percent":cfg.traffic_outside_china_percent,
                         "total_gbps":cfg.traffic_total_gbps,"dense_percentile":cfg.traffic_dense_percentile,"dense_max_satellites":cfg.traffic_dense_max_satellites,
                         "random_sigma":cfg.traffic_random_sigma,"cluster_radius_km":cfg.traffic_cluster_radius_km},
                     "traffic_landing_percent":cfg.traffic_landing_percent,"planning_demand_gbps":round(planning_demand,9),
@@ -1217,7 +1299,9 @@ class SimulationWorker(QObject):
                     "rain":{"enabled":cfg.rain_enabled,"sense_sigma":cfg.rain_sense_sigma,
                         "forecast_hours":cfg.rain_forecast_hours,"use_p90":cfg.rain_use_p90},
                     "effective_station_capacity_gbps":round(effective_station_capacity,9),"traffic_cell_count":len(traffic_cells)}
-                deployment_path=Path(cfg.scenario_directory)/"base_data"/"gateway_deployment.json" if cfg.scenario_directory else None
+                gateway_key=hashlib.sha256(json.dumps(gateway_spec,sort_keys=True,ensure_ascii=False,separators=(",",":")).encode("utf-8")).hexdigest()[:24]
+                gateway_root=cache_root/"gateways";gateway_root.mkdir(parents=True,exist_ok=True)
+                deployment_path=gateway_root/f"{gateway_key}.json"
                 if deployment_path and deployment_path.is_file():
                     try:
                         cached_deployment=json.loads(deployment_path.read_text(encoding="utf-8"))
@@ -1257,20 +1341,76 @@ class SimulationWorker(QObject):
                 if deployment_path and not gateway_cache_reused:
                     deployment_path.parent.mkdir(parents=True,exist_ok=True);temporary_deployment=deployment_path.with_suffix(".building.json")
                     temporary_deployment.write_text(json.dumps(gateway_deployment,ensure_ascii=False,indent=2),encoding="utf-8");temporary_deployment.replace(deployment_path)
+            rain_key="";rain_cache_path="";rain_spatial_cache_reused=False
+            rain_model_key="";rain_model_path="";rain_cache_reused=False
+            install_scenario_spatial_cache(())
+            if cfg.rain_enabled:
+                rain_model_spec={"cache_version":1,"source":cfg.rain_source,
+                                 "sense_sigma":cfg.rain_sense_sigma,"forecast_hours":cfg.rain_forecast_hours,
+                                 "use_p90":cfg.rain_use_p90,"duration_s":cfg.duration_s,"step_s":cfg.step_s,
+                                 "stations":[{key:site.get(key) for key in ("lat","lon","alt","frequency_ghz",
+                                              "polarization_tilt_deg","rain_rate_001_mmh","rain_rate_mmh",
+                                              "representative_rain_rate_mmh") if key in site} for site in cfg.stations]}
+                rain_model_key=hashlib.sha256(json.dumps(rain_model_spec,sort_keys=True,separators=(",",":"),ensure_ascii=False).encode("utf-8")).hexdigest()[:24]
+                rain_root=cache_root/"rain";rain_root.mkdir(parents=True,exist_ok=True)
+                model_file=rain_root/f"model_{rain_model_key}.json";rain_model_path=str(model_file)
+                if model_file.is_file():
+                    try:rain_cache_reused=json.loads(model_file.read_text(encoding="utf-8")).get("spec")==rain_model_spec
+                    except (OSError,ValueError,TypeError):pass
+                if not rain_cache_reused:
+                    temporary_model=model_file.with_suffix(".building.json")
+                    temporary_model.write_text(json.dumps({"spec":rain_model_spec},ensure_ascii=False,separators=(",",":")),encoding="utf-8")
+                    temporary_model.replace(model_file)
+                rain_slots=range(max(1,int(math.floor(cfg.duration_s/300.))+1))
+                rain_spec={"cache_version":1,"profile":RAIN_GRADE_SPATIAL_PROFILES,
+                           "stations":[[round(float(site.get("lat",0)),6),round(float(site.get("lon",0)),6)] for site in cfg.stations],
+                           "slot_count":len(rain_slots)}
+                rain_key=hashlib.sha256(json.dumps(rain_spec,sort_keys=True,separators=(",",":")).encode("utf-8")).hexdigest()[:24]
+                rain_file=rain_root/f"{rain_key}.json";rain_cache_path=str(rain_file);rain_rows=None
+                if rain_file.is_file():
+                    try:
+                        stored=json.loads(rain_file.read_text(encoding="utf-8"))
+                        if stored.get("spec")==rain_spec and len(stored.get("factors",[]))==len(cfg.stations)*len(RAIN_GRADE_SPATIAL_PROFILES)*len(rain_slots):
+                            rain_rows=stored["factors"];rain_spatial_cache_reused=True
+                    except (OSError,ValueError,KeyError,TypeError):pass
+                if rain_rows is None:
+                    rain_rows=[[float(site.get("lat",0)),float(site.get("lon",0)),grade,slot,
+                                scenario_spatial_factor(site,grade,slot*300.)]
+                               for site in cfg.stations for grade in RAIN_GRADE_SPATIAL_PROFILES for slot in rain_slots]
+                    temporary_rain=rain_file.with_suffix(".building.json")
+                    temporary_rain.write_text(json.dumps({"spec":rain_spec,"factors":rain_rows},ensure_ascii=False,separators=(",",":")),encoding="utf-8")
+                    temporary_rain.replace(rain_file)
+                install_scenario_spatial_cache(rain_rows)
             geo_satellites=[]
             if cfg.geo_interference_enabled:
                 offset=(cfg.geo_satellite_count-1)/2
                 geo_satellites=[{"id":index,"name":f"GEO-{index+1:02d}","longitude_deg":round(cfg.geo_center_longitude_deg+(index-offset)*cfg.geo_longitude_spacing_deg,4),"altitude_km":cfg.geo_altitude_km} for index in range(cfg.geo_satellite_count)]
             aggregate_i_over_n_db=(cfg.gso_i_over_n_db+10*math.log10(max(1,cfg.geo_satellite_count))) if cfg.geo_interference_enabled else None
             gso_penalty_db=10*math.log10(1+10**(aggregate_i_over_n_db/10)) if aggregate_i_over_n_db is not None else 0.0
+            scenario_basic=Path(cfg.scenario_directory)/"base_data"
+            scenario_basic.mkdir(parents=True,exist_ok=True)
+            asset_manifest={"asset_type":"basic_data_references","cache_version":1,
+                "tle":{"key":tle_asset_hash[:24],"path":str(shared_tle_asset),"scenario_file":str(tle_asset)},
+                "topology":{"key":topology_key,"path":str(topology_path),"reused":topology_cache_reused},
+                "orbit":{"key":cache_key,"path":orbit_cache_path,"reused":orbit_cache_reused},
+                "traffic":{"key":traffic_key,"path":traffic_cache_path,"reused":traffic_cache_reused},
+                "gateways":{"key":gateway_key,"path":str(deployment_path) if deployment_path else "","reused":gateway_cache_reused}}
+            asset_manifest["rain"]={"key":rain_model_key,"path":rain_model_path,"reused":rain_cache_reused,
+                                    "spatial_key":rain_key,"spatial_path":rain_cache_path,"spatial_reused":rain_spatial_cache_reused}
+            asset_manifest["isl_model"]={"key":isl_model_key,"path":str(isl_model_file),"reused":isl_model_reused}
+            (scenario_basic/"basic_assets_manifest.json").write_text(json.dumps(asset_manifest,ensure_ascii=False,indent=2),encoding="utf-8")
             self.progress.emit(98, f"准备阶段 4/4：正在建立 {total_frames:,} 个时间点的时间轴和场景描述")
             self.prepared.emit({"satellite_count": len(satellites), "planes": cfg.planes,
                 "per_plane": per_plane, "frames": total_frames, "epoch": epoch.isoformat(),
                 "walker_mode": cfg.walker_mode, "walker_shells": shell_runs,
-                "orbit_cache": bool(orbit_cache is not None), "orbit_cache_path": orbit_cache_path,
+                "orbit_cache": bool(orbit_cache is not None), "orbit_cache_path": orbit_cache_path,"orbit_cache_reused":orbit_cache_reused,
+                "topology_cache_path":str(topology_path),"topology_cache_reused":topology_cache_reused,
+                "isl_model_path":str(isl_model_file),"isl_model_reused":isl_model_reused,
                 "orbit_cache_size_mb": round(orbit_cache_bytes/1024/1024,1) if orbit_cache is not None else 0,
                 "traffic_cache": bool(traffic_cache_connection is not None),"traffic_cache_path":traffic_cache_path,"traffic_cache_reused":traffic_cache_reused,
                 "gateway_cache_reused":gateway_cache_reused,
+                "rain_cache_path":rain_cache_path,"rain_cache_reused":rain_cache_reused,
+                "rain_model_path":rain_model_path,"rain_spatial_cache_reused":rain_spatial_cache_reused,
                 "geo_interference_enabled":cfg.geo_interference_enabled,"geo_satellites":geo_satellites,
                 "gso_i_over_n_db":cfg.gso_i_over_n_db,"gso_aggregate_i_over_n_db":round(aggregate_i_over_n_db,3) if aggregate_i_over_n_db is not None else None,
                 "gso_interference_penalty_db":round(gso_penalty_db,3),"gso_protection_angle_deg":cfg.gso_protection_angle_deg,
@@ -1278,6 +1418,7 @@ class SimulationWorker(QObject):
                 "traffic_update_period_s":traffic_update_period_s,"traffic_keyframe_count":traffic_keyframe_count,
                 "satellite_labels": satellite_labels,
                 "tle_asset_path":str(tle_asset),"tle_asset_hash":tle_asset_hash,
+                "constellation_cache_reused":constellation_cache_reused if cfg.source=="walker" else False,
                 "step_s": cfg.step_s,
                 "latitude_limit": cfg.latitude_limit_deg, "stations": cfg.stations,
                 "min_elevation_deg": cfg.min_elevation_deg, "max_gsl_km": cfg.max_gsl_km,
@@ -1361,18 +1502,27 @@ class SimulationWorker(QObject):
                         "bandwidth_mhz":planner.config.bandwidth_mhz,"snr_margin_db":planner.config.snr_margin_db,"frequency_ghz":planner.config.feeder_frequency_ghz,"rolloff":planner.config.feeder_rolloff,"satellite_eirp_dbw":planner.config.satellite_eirp_dbw,"gateway_gt_dbk":planner.config.gateway_gt_dbk,"gateway_array_loss_db":planner.config.gateway_array_loss_db,
                         "modcod":[[row.name,row.minimum_snr_db,row.spectral_efficiency,row.rate_gbps] for row in planner.config.modcod_table],
                         "priority_regions":list(planner.config.priority_task_regions),
-                        "gso":[planner.config.geo_interference_enabled,planner.config.geo_satellite_count,planner.config.gso_i_over_n_db,planner.config.gso_protection_angle_deg]}
+                        "gso":[planner.config.geo_interference_enabled,planner.config.geo_satellite_count,planner.config.gso_i_over_n_db,planner.config.gso_protection_angle_deg],
+                        "priority_routing_version":4}
                     offline_spec["tle_asset_hash"]=tle_asset_hash
+                    offline_spec.update(topology_key=topology_key,rain_spatial_key=rain_key,min_elevation_deg=cfg.min_elevation_deg,max_gsl_km=cfg.max_gsl_km,
+                        rain_model=[cfg.rain_enabled,cfg.rain_source,cfg.rain_sense_sigma,cfg.rain_forecast_hours,cfg.rain_use_p90],
+                        geo_geometry=[cfg.geo_center_longitude_deg,cfg.geo_longitude_spacing_deg,cfg.geo_altitude_km])
                     if planner.config.selection_strategy=="window_margin":offline_spec.update(cache_version=16,algorithm_version=32,objective_formula="weighted_window_mean_capacity_delay_v4",selection_strategy="window_margin",window_sampling="six_points_mean_and_min_rate_v1")
                     offline_spec_hash=hashlib.sha256(json.dumps(offline_spec,ensure_ascii=False,sort_keys=True,separators=(",",":")).encode("utf-8")).hexdigest()
-                    offline_cache_path=Path(cfg.scenario_directory)/"base_data"/"offline_plans.json" if cfg.scenario_directory else None
+                    planning_root=cache_root/"planning";planning_root.mkdir(parents=True,exist_ok=True)
+                    offline_cache_path=planning_root/f"{offline_spec_hash[:24]}.json"
                     cached_statistics={}
                     def record_offline_asset(cache_reused,statistics):
                         if not offline_cache_path:return
-                        manifest_path=offline_cache_path.parent/"basic_assets_manifest.json"
+                        scenario_basic=Path(cfg.scenario_directory)/"base_data" if cfg.scenario_directory else offline_cache_path.parent
+                        scenario_basic.mkdir(parents=True,exist_ok=True)
+                        scenario_copy=scenario_basic/"offline_plans.json"
+                        if scenario_copy!=offline_cache_path:shutil.copy2(offline_cache_path,scenario_copy)
+                        manifest_path=scenario_basic/"basic_assets_manifest.json"
                         try:manifest=json.loads(manifest_path.read_text(encoding="utf-8")) if manifest_path.is_file() else {}
                         except (OSError,ValueError,TypeError):manifest={}
-                        manifest["offline_planning"]={"file":offline_cache_path.name,"planning_spec_hash":offline_spec_hash,
+                        manifest["offline_planning"]={"file":scenario_copy.name,"shared_cache_path":str(offline_cache_path),"planning_spec_hash":offline_spec_hash,
                             "plan_count":len(catalog),"cache_reused":bool(cache_reused),**statistics}
                         manifest_path.write_text(json.dumps(manifest,ensure_ascii=False,indent=2),encoding="utf-8")
                     if offline_cache_path and offline_cache_path.is_file():
@@ -1430,18 +1580,21 @@ class SimulationWorker(QObject):
                         # window.  Average per-source spatial demand across
                         # six samples, then scale to the peak sampled total.
                         # This avoids treating all six peaks as simultaneous.
-                        traffic_sum={};sample_totals=[]
+                        traffic_sum={};priority_sum={};sample_totals=[]
                         for sample_index in [frame_at]+[min(total_frames-1,max(0,round(ti/cfg.step_s))) for ti in sample_times]:
                             if sample_index==frame_at:
-                                source_rows=plan_traffic
+                                source_rows=plan_traffic;grid_rows=_traffic
                             else:
-                                _ignored,source_rows,_sample_elapsed=read_traffic_cache_frame(traffic_source,sample_index)
+                                grid_rows,source_rows,_sample_elapsed=read_traffic_cache_frame(traffic_source,sample_index)
+                            for sid,amount in priority_traffic_by_satellite(grid_rows,cfg.priority_task_regions).items():
+                                priority_sum[sid]=priority_sum.get(sid,0.)+amount
                             sample_totals.append(sum(float(row[1]) for row in source_rows))
                             for row in source_rows:
                                 sid=int(row[0]);traffic_sum[sid]=traffic_sum.get(sid,0.)+float(row[1])
                         average_total=sum(sample_totals)/len(sample_totals)
                         scale=max(sample_totals)/average_total if average_total>1e-12 else 1.
                         plan_traffic=[[sid,amount*scale/len(sample_totals)] for sid,amount in traffic_sum.items() if amount>1e-12]
+                        plan_priority={sid:amount*scale/len(sample_totals) for sid,amount in priority_sum.items() if amount>1e-12}
                         for grade,scenario_percentile in grades:
                             if self._stop.is_set():return
                             plan_started=time.perf_counter()
@@ -1459,7 +1612,7 @@ class SimulationWorker(QObject):
                                     window_rates[(gateway,satellite)]={"rate_gbps":rate,"mean_rate_gbps":sum(item[0] for item in states)/len(states),"snr_db":snr,"modcod":mcs,
                                                                          "rain_attenuation_db":fade,"worst_elevation_deg":elevation,
                                                                          "worst_time_s":worst_time}
-                            plan=planner.generate(plan_time,plan_positions,plan_links,plan_gsls,plan_traffic,rain_scenario_percentile=scenario_percentile,rain_grade=grade,commit=False,window_rates=window_rates)
+                            plan=planner.generate(plan_time,plan_positions,plan_links,plan_gsls,plan_traffic,rain_scenario_percentile=scenario_percentile,rain_grade=grade,commit=False,window_rates=window_rates,priority_traffic=plan_priority)
                             if self._stop.is_set():return
                             plan.update(id=f"offline_{grade}_{plan_time}",generation=len(catalog)+1,offline=True,epoch_index=epoch_index,
                                         valid_from_s=float(plan_time),valid_until_s=float(plan_time+planning_interval_s),calculation_ms=round((time.perf_counter()-plan_started)*1000,3),
@@ -1574,7 +1727,8 @@ class SimulationWorker(QObject):
                 gsls,timings["gsl_ms"]=gsl_future.result()
                 if traffic_future is not None:traffic_rows,satellite_traffic,timings["traffic_ms"]=traffic_future.result()
                 stage_start=time.perf_counter()
-                planning = planner.update(sim_time, positions, links, gsls, satellite_traffic) if planner else None
+                priority_traffic=priority_traffic_by_satellite(traffic_rows,cfg.priority_task_regions) if planner else {}
+                planning = planner.update(sim_time, positions, links, gsls, satellite_traffic,priority_traffic=priority_traffic) if planner else None
                 timings["planning_ms"]=round((time.perf_counter()-stage_start)*1000,1)
                 if planning:
                     active=planning.get("active_evaluation") or {}
@@ -1627,6 +1781,7 @@ class SimulationWorker(QObject):
                     "satellites": positions, "isls": links, "seams": seams,
                     "gsls": gsls, "traffic": traffic_rows,
                     "satellite_traffic": satellite_traffic,
+                    "priority_satellite_traffic": [[sid,amount] for sid,amount in priority_traffic.items() if amount>0],
                     "planning": planning,
                     "summary":frame_summary,
                     "timings_ms":timings,
@@ -1922,7 +2077,7 @@ class MainWindow(QMainWindow):
             self.traffic_total_gbps.setValue(float(data.get("traffic_total_gbps",500)));self.traffic_landing_percent.setValue(float(data.get("traffic_landing_percent",30)))
             self.traffic_cluster_radius.setValue(float(data.get("traffic_cluster_radius_km",180)))
             self.priority_region_table.setRowCount(0)
-            for region in data.get("priority_task_regions",[]):self._append_priority_region(region.get("name","重点区域"),region.get("lat",0),region.get("lon",0),region.get("radius_km",100))
+            for region in (data.get("priority_task_regions") or [{"name":"新疆重点区域","lat":42.0,"lon":85.0,"radius_km":900}]):self._append_priority_region(region.get("name","重点区域"),region.get("lat",0),region.get("lon",0),region.get("radius_km",100))
             self.rain_enabled.setChecked(bool(data.get("rain_enabled",True)))
             rain_sources=("geographic_auto","manual_sequence","weather_file");rain_source=str(data.get("rain_source","geographic_auto"));self.rain_source.setCurrentIndex(rain_sources.index(rain_source) if rain_source in rain_sources else 0)
             rain_sigmas=(0.50,0.35,0.20,0.12);rain_sigma=float(data.get("rain_sense_sigma",0.20));self.rain_sense.setCurrentIndex(min(range(len(rain_sigmas)),key=lambda i:abs(rain_sigmas[i]-rain_sigma)))
@@ -2001,7 +2156,7 @@ class MainWindow(QMainWindow):
             if not self.loaded_frame_indices:raise ValueError("结果包中尚无已保存的动态帧")
             self.display_planes.setCurrentIndex(2); self.center_plane.setValue(1)
             self.timeline.setRange(self.loaded_frame_indices[0],self.loaded_frame_indices[-1]); self.timeline.setEnabled(True); self.prepared_ready=True; self.is_paused=True
-            prepared["layers"]=self._layer_options(); prepared["center_plane"]=0; prepared["display_plane_count"]=0; self.web.page().runJavaScript(f"configureScenario({json.dumps(prepared,ensure_ascii=False)})")
+            prepared["layers"]=self._layer_options(); prepared["center_plane"]=0; prepared["display_plane_count"]=0; prepared["priority_regions"]=list(self.active_config.priority_task_regions); self.web.page().runJavaScript(f"configureScenario({json.dumps(prepared,ensure_ascii=False)})")
             self.result_frame_position=0; self.result_playing=False; self.result_play_timer.stop()
             self.prepare_btn.setEnabled(False);self.start_btn.setText("播放结果"); self.start_btn.setEnabled(True); self.stop_btn.setEnabled(True); self.state_badge.setText("● 正在读取"); self.status.setText(f"正在读取结果包首帧：{path}")
             self._sync_run_controls()
@@ -2232,6 +2387,8 @@ class MainWindow(QMainWindow):
         self.traffic_outside_china_percent=self._spin(0,100,0,1," %"); tf.addRow("中国以外业务量",self.traffic_outside_china_percent)
         self.traffic_outside_china_percent.setToolTip("相对于各境外网格原始人口业务权重的比例；0%表示境外业务不参与计算和显示")
         self.priority_region_table=QTableWidget(0,4);self.priority_region_table.setHorizontalHeaderLabels(["任务区域","纬度","经度","范围 km"]);self.priority_region_table.horizontalHeader().setSectionResizeMode(QHeaderView.ResizeMode.Stretch);self.priority_region_table.setMaximumHeight(150)
+        self.priority_region_table.setToolTip("重点区域按中心坐标和半径构成圆形范围；新疆默认值为近似覆盖，可按业务范围调整。")
+        self._append_priority_region("新疆重点区域",42.0,85.0,900)
         priority_buttons=QHBoxLayout();self.add_priority_region_btn=QPushButton("增加重点区域");self.remove_priority_region_btn=QPushButton("删除重点区域");self.add_priority_region_btn.clicked.connect(lambda:self._append_priority_region("重点区域",39.9,116.4,300));self.remove_priority_region_btn.clicked.connect(self._remove_priority_region);priority_buttons.addWidget(self.add_priority_region_btn);priority_buttons.addWidget(self.remove_priority_region_btn)
         tf.addRow("重点任务区域",self.priority_region_table);tf.addRow(priority_buttons)
         traffic_note=QLabel("业务规模基准不是每帧固定总速率；时段系数会改变实际业务。落地需求 = 当前接入业务 × 落地比例。修改此页后需重新生成基础数据并重新规划。")
@@ -2447,7 +2604,7 @@ class MainWindow(QMainWindow):
         self.duration.setMaximumWidth(92);self.step.setMaximumWidth(82)
         toolbar.addWidget(QLabel("时长"));toolbar.addWidget(self.duration);toolbar.addWidget(QLabel("步进"));toolbar.addWidget(self.step);toolbar.addWidget(QLabel("倍速"));toolbar.addWidget(self.speed);toolbar.addSeparator()
         status_bar=self.statusBar();status_bar.setSizeGripEnabled(False);status_bar.setFixedHeight(36)
-        self.state_badge=QLabel("● 就绪");self.cache_status_label=QLabel("● 轨道缓存 --　● 业务缓存 --");self.cache_status_label.setMinimumWidth(275);self.cache_status_label.setAlignment(Qt.AlignmentFlag.AlignCenter);self.cache_status_label.setStyleSheet("QLabel{color:#ff6675;background:#35131b;border:1px solid #ff3b4f;border-radius:3px;padding:3px 8px;font-weight:700}");self.cache_status_label.setToolTip("轨道位置缓存与业务时变缓存状态"); self.resource_label=QLabel("资源 CPU -- / 内存 --"); self.alert_label=QLabel("告警 0")
+        self.state_badge=QLabel("● 就绪");self.cache_status_label=QLabel("缓存 --");self.cache_status_label.setMaximumWidth(145);self.cache_status_label.setAlignment(Qt.AlignmentFlag.AlignCenter);self.cache_status_label.setStyleSheet("QLabel{color:#ff6675;background:#35131b;border:1px solid #ff3b4f;border-radius:3px;padding:3px 8px;font-weight:700}");self.cache_status_label.setToolTip("悬停查看各模型缓存状态"); self.resource_label=QLabel("资源 CPU -- / 内存 --"); self.alert_label=QLabel("告警 0")
         for widget in (self.state_badge,self.cache_status_label,self.resource_label,self.alert_label): widget.setObjectName("statusSegment")
         status_bar.addWidget(self.state_badge); status_bar.addWidget(self.status,1);status_bar.addPermanentWidget(self.cache_status_label); status_bar.addPermanentWidget(QLabel("计算")); status_bar.addPermanentWidget(self.compute_progress); status_bar.addPermanentWidget(QLabel("传输")); status_bar.addPermanentWidget(self.transfer_progress); status_bar.addPermanentWidget(self.resource_label); status_bar.addPermanentWidget(self.alert_label)
         for name in ("佳木斯","北京","喀什","拉萨","三亚"):self._append_station(name,*PRESET_STATIONS[name])
@@ -2971,7 +3128,7 @@ class MainWindow(QMainWindow):
         _scenario_id,_scenario_hash,scenario_dir=self._public_scenario(cfg)
         cfg.scenario_directory=str(scenario_dir);cfg.result_directory=""
         self.result_store=None;self.result_store_path=None;self.requested_result_path=None;self.loaded_result=False
-        self.active_config=cfg; self.prepared_ready=False; self.prepared_metadata=None; self.summary_history.clear(); self.planning_results.clear();self.planning_resources.clear();self.planning_evaluation.clear();self._populate_planning_choices([]); self._refresh_parameter_actions(); self.preparation_started_at=time.perf_counter();self.run_started_at=None;self.run_elapsed_s=0.0;self.elapsed_phase="preparation";self.elapsed_label.setText("准备耗时 00:00:00");self.cache_status_label.setText("● 轨道缓存 检查中　● 业务缓存 等待");self.cache_status_label.setStyleSheet("QLabel{color:#ff6675;background:#35131b;border:1px solid #ff3b4f;border-radius:3px;padding:3px 8px;font-weight:700}"); self.state_badge.setText("● 准备中"); self.alert_label.setText("告警 0"); self._set_scenario_editable(False);self.busy_overlay.start("正在检查并生成场景基础数据…")
+        self.active_config=cfg; self.prepared_ready=False; self.prepared_metadata=None; self.summary_history.clear(); self.planning_results.clear();self.planning_resources.clear();self.planning_evaluation.clear();self._populate_planning_choices([]); self._refresh_parameter_actions(); self.preparation_started_at=time.perf_counter();self.run_started_at=None;self.run_elapsed_s=0.0;self.elapsed_phase="preparation";self.elapsed_label.setText("准备耗时 00:00:00");self.cache_status_label.setText("缓存检查中");self.cache_status_label.setToolTip("正在检查各模型缓存");self.cache_status_label.setStyleSheet("QLabel{color:#ff6675;background:#35131b;border:1px solid #ff3b4f;border-radius:3px;padding:3px 8px;font-weight:700}"); self.state_badge.setText("● 准备中"); self.alert_label.setText("告警 0"); self._set_scenario_editable(False);self.busy_overlay.start("正在检查并生成场景基础数据…")
         self._set_property_drawer(False)
         self.user_stopping = False; self.prepared_ready = False
         self.latest_full_frame = None; self.current_full_frame = None; self.scenario_planes = None; self.pending_frame = None
@@ -3000,6 +3157,7 @@ class MainWindow(QMainWindow):
         self.prepared_metadata=dict(data)
         self.scenario_planes = data["planes"]
         data["layers"] = self._layer_options()
+        data["priority_regions"] = list(self.active_config.priority_task_regions)
         self.frame_cache_limit = max(5, min(120, 500_000 // max(1, data["satellite_count"])))
         self.timeline.setRange(0, max(0, data["frames"]-1)); self.timeline.setValue(0); self.timeline.setEnabled(True)
         self.web.page().runJavaScript(f"configureScenario({json.dumps(data,ensure_ascii=False)})")
@@ -3012,10 +3170,19 @@ class MainWindow(QMainWindow):
         self._set_tree_children(self.traffic_tree,["状态：空间权重已载入",f"业务网格：{data.get('traffic_cell_count',0):,}个",f"业务基准：{self.traffic_total_gbps.value():g} Gb/s",f"业务落地比例：{self.traffic_landing_percent.value():g}%",f"规划采样：{data.get('traffic_keyframe_count',0)}个 / {data.get('traffic_update_period_s',30):g}s",f"时间演化：地方时双峰曲线"])
         self._set_tree_children(self.rain_tree,["状态：参数已配置",f"来源：{self.rain_source.currentText()}",f"感知：{self.rain_sense.currentText()}",f"预报提前期：{self.rain_forecast.value():g} h",f"规划上界：{'P90' if self.rain_p90.isChecked() else '均值'}","统计工况：轻雨5% / 中雨1% / 重雨0.1%超越概率"])
         self._set_tree_children(self.results_tree,["当前帧：等待播放","可见卫星：--","有效ISL：--","GSL：--"])
-        cache_text=f"已缓存 {data.get('orbit_cache_size_mb',0):g} MB" if data.get("orbit_cache") else "按需计算";traffic_cache_text="已复用" if data.get("traffic_cache_reused") else ("已生成" if data.get("traffic_cache") else "按需计算")
-        self.cache_status_label.setText(f"● 轨道缓存 {'已就绪' if data.get('orbit_cache') else '实时'}　● 业务缓存 {traffic_cache_text}　● 信关站 手动设置")
+        cache_text=f"已缓存 {data.get('orbit_cache_size_mb',0):g} MB" if data.get("orbit_cache") else "按需计算";traffic_cache_text=("关闭" if not self.active_config.traffic_enabled else "已复用" if data.get("traffic_cache_reused") else "已生成" if data.get("traffic_cache") else "按需计算")
+        deployment=data.get("gateway_deployment") or {}
+        orbit_text=("复用" if data.get("orbit_cache_reused") else "新算") if data.get("orbit_cache") else "按需计算"
+        topology_text="未变" if data.get("isl_model_reused") else "已更新"
+        gateway_text=("复用" if data.get("gateway_cache_reused") else "新算") if deployment.get("mode")=="automatic" else "手动"
+        rain_text=("未变" if data.get("rain_cache_reused") else "已更新") if self.active_config.rain_enabled else "关闭"
+        cache_states=[("轨道",orbit_text),("ISL模型",topology_text),("业务时变",traffic_cache_text),("信关站",gateway_text),("雨衰参数",rain_text)]
+        reused=sum(value in ("复用","已复用","未变") for _,value in cache_states)
+        updated=sum(value in ("新算","已生成","已更新") for _,value in cache_states)
+        self.cache_status_label.setText(f"缓存 {reused}复用·{updated}更新")
+        self.cache_status_label.setToolTip("\n".join(f"{name}：{value}" for name,value in cache_states))
         self.cache_status_label.setStyleSheet("QLabel{color:#72ffb0;background:#0b3324;border:1px solid #20df83;border-radius:3px;padding:3px 8px;font-weight:700}")
-        deployment=data.get("gateway_deployment") or {};self.planning_results.set_gateway_deployment(deployment)
+        self.planning_results.set_gateway_deployment(deployment)
         if deployment.get("mode")=="automatic":
             self.station_table.blockSignals(True);self.station_table.setRowCount(0)
             self.station_table.setHorizontalHeaderLabels(["自动规划结果","纬度","经度","高度m","规划天线","规划信道"])
@@ -3709,6 +3876,18 @@ class MainWindow(QMainWindow):
             traffic_cache_source=Path(str(prepared.get("traffic_cache_path","")))
             if prepared.get("traffic_cache") and traffic_cache_source.is_file():
                 source_db=sqlite3.connect(str(traffic_cache_source));target_db=sqlite3.connect(str(out/"traffic_timeseries.sqlite"));source_db.backup(target_db);target_db.close();source_db.close();manifest["traffic_timeseries_cache"]="traffic_timeseries.sqlite"
+            topology_cache_source=Path(str(prepared.get("topology_cache_path","")))
+            if topology_cache_source.is_file():
+                shutil.copy2(topology_cache_source,out/"isl_candidates.npz");manifest["isl_candidates_cache"]="isl_candidates.npz"
+            isl_model_source=Path(str(prepared.get("isl_model_path","")))
+            if prepared.get("isl_model_path") and isl_model_source.is_file():
+                shutil.copy2(isl_model_source,out/"isl_model.json");manifest["isl_model"]="isl_model.json"
+            rain_cache_source=Path(str(prepared.get("rain_cache_path","")))
+            if prepared.get("rain_cache_path") and rain_cache_source.is_file():
+                shutil.copy2(rain_cache_source,out/"rain_spatial_factors.json");manifest["rain_spatial_cache"]="rain_spatial_factors.json"
+            rain_model_source=Path(str(prepared.get("rain_model_path","")))
+            if prepared.get("rain_model_path") and rain_model_source.is_file():
+                shutil.copy2(rain_model_source,out/"rain_model.json");manifest["rain_model"]="rain_model.json"
             offline_plan_source=Path(cfg.scenario_directory)/"base_data"/"offline_plans.json" if cfg.scenario_directory else Path()
             if cfg.scenario_directory and offline_plan_source.is_file():
                 shutil.copy2(offline_plan_source,out/"offline_plans.json")
@@ -3723,10 +3902,15 @@ class MainWindow(QMainWindow):
             (out/"gateway_deployment.json").write_text(json.dumps(prepared.get("gateway_deployment",{}),ensure_ascii=False,indent=2),encoding="utf-8")
             manifest["gateway_deployment"]="gateway_deployment.json"
             candidates=[];seams=[]
-            shell_runs=prepared.get("walker_shells") or [{"planes":cfg.planes,"per_plane":max(1,int(prepared.get("per_plane",cfg.satellite_count//max(1,cfg.planes)))),"satellite_offset":0}]
-            for shell in shell_runs:
-                local,local_seams=make_candidates(int(shell["planes"]),int(shell["per_plane"]),cfg.isl_pattern,cfg.seam_enabled,int(shell["planes"])-1)
-                offset=int(shell.get("satellite_offset",0));candidates.extend((a+offset,b+offset,k) for a,b,k in local);seams.extend((a+offset,b+offset,k) for a,b,k in local_seams)
+            if topology_cache_source.is_file():
+                import numpy as np
+                with np.load(topology_cache_source) as stored_topology:
+                    candidates=stored_topology["candidates"].tolist();seams=stored_topology["seams"].tolist()
+            else:
+                shell_runs=prepared.get("walker_shells") or [{"planes":cfg.planes,"per_plane":max(1,int(prepared.get("per_plane",cfg.satellite_count//max(1,cfg.planes)))),"satellite_offset":0}]
+                for shell in shell_runs:
+                    local,local_seams=make_candidates(int(shell["planes"]),int(shell["per_plane"]),cfg.isl_pattern,cfg.seam_enabled,int(shell["planes"])-1)
+                    offset=int(shell.get("satellite_offset",0));candidates.extend((a+offset,b+offset,k) for a,b,k in local);seams.extend((a+offset,b+offset,k) for a,b,k in local_seams)
             seam_pairs={(a,b) for a,b,_kind in seams}
             with (out/"isl_candidates.csv").open("w",newline="",encoding="utf-8-sig") as f:
                 w=csv.writer(f);w.writerow(["source_satellite","target_satellite","link_type","seam_candidate"])
@@ -3818,8 +4002,8 @@ class MainWindow(QMainWindow):
         self.compute_progress.setValue(value);self.status.setText(text)
         if self.elapsed_phase=="preparation" or (self.offline_planning_started_at is not None and str(text).startswith("离线规划")):
             self.busy_overlay.set_progress(value,text)
-        if "业务缓存" in text:self.cache_status_label.setText("● 轨道缓存 已就绪　● 业务缓存 生成中")
-        elif "轨道缓存" in text:self.cache_status_label.setText("● 轨道缓存 生成中　● 业务缓存 等待")
+        if "业务缓存" in text:self.cache_status_label.setText("业务缓存生成中")
+        elif "轨道缓存" in text:self.cache_status_label.setText("轨道缓存生成中")
     @Slot(str)
     def _failed(self,text):
         if self.user_stopping:return
@@ -3851,7 +4035,7 @@ class MainWindow(QMainWindow):
             self.summary_history.clear(); self.active_config = None; self.prepared_metadata = None
             self.planning_results.clear();self.planning_resources.clear();self.planning_evaluation.clear()
             self.result_store_path=None;self.scenario_planes=None;self.offline_planning_started_at=None
-            self.run_started_at=None;self.run_elapsed_s=0.0;self.preparation_started_at=None;self.elapsed_phase="idle"; self.elapsed_label.setText("准备耗时 00:00:00");self.cache_status_label.setText("● 轨道缓存 --　● 业务缓存 --"); self.state_badge.setText("● 就绪"); self.alert_label.setText("告警 0")
+            self.run_started_at=None;self.run_elapsed_s=0.0;self.preparation_started_at=None;self.elapsed_phase="idle"; self.elapsed_label.setText("准备耗时 00:00:00");self.cache_status_label.setText("缓存 --");self.cache_status_label.setToolTip("悬停查看各模型缓存状态"); self.state_badge.setText("● 就绪"); self.alert_label.setText("告警 0")
             self.transfer_queue.clear(); self.follow_live = True; self.is_paused = False
             self.start_btn.setText("开始仿真"); self.start_btn.setEnabled(False);self.stop_btn.setEnabled(False)
             self.timeline.setValue(0); self.timeline.setRange(0,0); self.timeline.setEnabled(False)

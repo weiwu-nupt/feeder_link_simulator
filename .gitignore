@@ -23,6 +23,7 @@ dist/
 # Generated simulation outputs and orbit cache
 /simulation_results/
 /simulation_scenarios/
+/simulation_cache/
 /constellation_sim/ui/cache/
 *.hysim
 *.log

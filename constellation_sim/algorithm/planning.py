@@ -251,7 +251,13 @@ def _marginal_utility(carried_gbps,delay_ms,total_demand_gbps,capacity_weight,de
     delay_gain=delay_quality
     return wc*capacity_gain+wd*delay_gain,capacity_gain,delay_gain,delay_quality
 
-def _routes(g,feeders,demands,feeder_capacities=None,candidate_count=8,capacity_weight=1.,delay_weight=0.,delay_reference_ms=15.,feeder_gsl_distances=None,max_active_exits_per_source=2,source_exit_limits=None,source_excluded_feeders=None,source_priorities=None):
+def _priority_delivery(route_rows,priority_demands):
+    carried={}
+    for row in route_rows:
+        source=int(row.get("source",-1));carried[source]=carried.get(source,0.)+float(row.get("demand_gbps",0.))
+    return sum(min(float(amount),carried.get(int(source),0.)) for source,amount in (priority_demands or {}).items())
+
+def _routes(g,feeders,demands,feeder_capacities=None,candidate_count=8,capacity_weight=1.,delay_weight=0.,delay_reference_ms=15.,feeder_gsl_distances=None,max_active_exits_per_source=2,source_exit_limits=None,source_excluded_feeders=None,source_priorities=None,priority_demands=None):
     """Route traffic to nearby feeders without overloading one exit.
 
     The previous nearest-only multi-source Dijkstra ignored feeder capacity.
@@ -288,7 +294,8 @@ def _routes(g,feeders,demands,feeder_capacities=None,candidate_count=8,capacity_
             # 一个出口。第一个出口剩余容量不足时，第二出口负责补齐业务。
             source_exit_limits[int(source)]=max_active_exits_per_source
     residual={int(source):max(0.,float(demand)) for source,demand in demands.items()};exits={int(source):set() for source in demands};route_by_pair={}
-    def allocate(source,target,force_self=False):
+    priority_demands=priority_demands or {}
+    def allocate(source,target,force_self=False,priority_mode=False):
         requested=max(0.,float(demands.get(source,0.)));target=min(max(0.,float(target)),residual.get(source,0.));available_labels=set(labels[source])
         exit_limit=max(0,min(max_active_exits_per_source,int(source_exit_limits.get(int(source),max_active_exits_per_source))))
         excluded={int(value) for value in source_excluded_feeders.get(int(source),())}
@@ -320,6 +327,10 @@ def _routes(g,feeders,demands,feeder_capacities=None,candidate_count=8,capacity_
             own=next((row for row in options if row[8]==int(source)),None) if force_self else None
             feasible_options=[row for row in options if row[0]]
             if own is not None:choice=own
+            elif priority_mode:
+                # Fill nearby exits first, even when none can carry the whole
+                # priority demand. The remaining demand can use another exit.
+                choice=max(options,key=lambda row:(row[5],row[6]))
             elif capacity_weight==0 and delay_weight==0:
                 # Lexicographic objective: a feasible exit first, then the
                 # shortest path. If none can carry the source, carry as much
@@ -350,6 +361,10 @@ def _routes(g,feeders,demands,feeder_capacities=None,candidate_count=8,capacity_
     # A selected feeder first lands its own traffic through its zero-hop GSL.
     # Otherwise large remote sources can consume its capacity first and force
     # the feeder satellite's small local demand onto a multi-hop ISL detour.
+    # Reserve capacity for traffic originating in priority grid cells first.
+    # A satellite may carry both priority and ordinary traffic.
+    for source in sorted(residual,key=lambda value:float(priority_demands.get(int(value),0.)),reverse=True):
+        allocate(source,min(residual[source],max(0.,float(priority_demands.get(int(source),0.)))),priority_mode=True)
     local_sources=[source for source in residual if int(source) in remaining]
     for source in sorted(local_sources,key=lambda value:residual[value],reverse=True):
         allocate(source,min(residual[source],remaining.get(int(source),0.)),force_self=True)
@@ -366,7 +381,7 @@ def _routes(g,feeders,demands,feeder_capacities=None,candidate_count=8,capacity_
 
 def _routes_with_capacity_completion(g,feeders,demands,feeder_capacities=None,candidate_count=8,
                                      capacity_weight=1.,delay_weight=0.,delay_reference_ms=15.,
-                                     feeder_gsl_distances=None,max_active_exits_per_source=2,source_priorities=None):
+                                     feeder_gsl_distances=None,max_active_exits_per_source=2,source_priorities=None,priority_demands=None):
     """Allocate nearby exits first, then expose unused feeder capacity.
 
     A bounded nearest-exit search is necessary for real-time performance, but a
@@ -378,7 +393,7 @@ def _routes_with_capacity_completion(g,feeders,demands,feeder_capacities=None,ca
     routes=_routes(g,feeders,demands,capacities,candidate_count=candidate_count,
                    capacity_weight=capacity_weight,delay_weight=delay_weight,
                    delay_reference_ms=delay_reference_ms,feeder_gsl_distances=feeder_gsl_distances,
-                   max_active_exits_per_source=max_active_exits_per_source,source_priorities=source_priorities)
+                   max_active_exits_per_source=max_active_exits_per_source,source_priorities=source_priorities,priority_demands=priority_demands)
     used_by_feeder={};allocated_by_source={};exits_by_source={}
     for route in routes:
         source=int(route["source"]);feeder=int(route["feeder"]);amount=float(route.get("demand_gbps",0))
@@ -404,7 +419,8 @@ def _routes_with_capacity_completion(g,feeders,demands,feeder_capacities=None,ca
                       capacity_weight=capacity_weight,delay_weight=delay_weight,
                       delay_reference_ms=delay_reference_ms,feeder_gsl_distances=feeder_gsl_distances,
                       max_active_exits_per_source=max_active_exits_per_source,
-                      source_exit_limits=exit_limits,source_excluded_feeders=exits_by_source,source_priorities=source_priorities)
+                      source_exit_limits=exit_limits,source_excluded_feeders=exits_by_source,source_priorities=source_priorities,
+                      priority_demands={source:max(0.,float(priority_demands.get(source,0.))-allocated_by_source.get(source,0.)) for source in residual_demands} if priority_demands else None)
         if not extra:break
         progress=sum(float(route.get("demand_gbps",0)) for route in extra)
         if progress<=1e-9:break
@@ -442,23 +458,24 @@ def _routes_with_capacity_completion(g,feeders,demands,feeder_capacities=None,ca
                          delay_weight=delay_weight,delay_reference_ms=delay_reference_ms,
                          feeder_gsl_distances=feeder_gsl_distances,
                          max_active_exits_per_source=max_active_exits_per_source,
-                         source_priorities=source_priorities) if available else []
+                         source_priorities=source_priorities,
+                         priority_demands={source:max(0.,float((priority_demands or {}).get(source,0.))) for source in deficient}) if available else []
         old_amount=sum(float(route.get("demand_gbps",0)) for route in routes)
         new_routes=retained+rerouted
         new_amount=sum(float(route.get("demand_gbps",0)) for route in new_routes)
-        if new_amount<=old_amount+1e-6:break
+        if new_amount<=old_amount+1e-6 or _priority_delivery(new_routes,priority_demands)+1e-6<_priority_delivery(routes,priority_demands):break
         routes=new_routes
     return routes
 
 def _repair_routes_local(g,demands,feeder_capacities,feeder_gsl_distances=None,
                          capacity_weight=1.,delay_weight=0.,delay_reference_ms=15.,
                          excluded_feeders=None,exit_limits=None,max_visited_per_source=2000,
-                         max_exits_per_source=2):
+                         max_exits_per_source=2,priority_demands=None):
     """Repair affected sources with bounded source-local Dijkstra searches."""
     remaining={int(k):max(0.,float(v)) for k,v in feeder_capacities.items() if float(v)>1e-9}
     feeder_set=set(remaining);gsl=feeder_gsl_distances or {};excluded_feeders=excluded_feeders or {};exit_limits=exit_limits or {}
     total=max(sum(max(0.,float(v)) for v in demands.values()),1e-12);result=[]
-    for source,requested in sorted(demands.items(),key=lambda item:(int(item[0]) in feeder_set,item[1]),reverse=True):
+    for source,requested in sorted(demands.items(),key=lambda item:(float((priority_demands or {}).get(int(item[0]),0.)),int(item[0]) in feeder_set,item[1]),reverse=True):
         source=int(source);left=max(0.,float(requested));limit=max(0,min(max_exits_per_source,int(exit_limits.get(source,max_exits_per_source))))
         if left<=1e-9 or limit<=0 or not remaining:continue
         distances={source:0.};previous={source:-1};queue=[(0.,source)];found=[];visited=0;excluded=set(excluded_feeders.get(source,()))
@@ -589,7 +606,7 @@ class SlowFastLoopPlanner:
                                   "rain_scenario_percentile":rain_scenario_percentile,"rain_actual_db":rain["actual_attenuation_db"],
                                   "rain_rate_mmh":rain["rain_rate_mmh"],"rain_severity":rain_grade or rain["severity"]})
         return out
-    def _select(self,candidates,g,demands,capacity_only=False):
+    def _select(self,candidates,g,demands,capacity_only=False,priority_demands=None):
         component_demand=_component_demand(g,demands)
         component_by_node=_component_ids(g)
         if demands:candidates=[x for x in candidates if component_demand[x["satellite"]]>0]
@@ -599,24 +616,32 @@ class SlowFastLoopPlanner:
         def select_with_k(k):
             options=_k_nearest_candidate_options(g,candidates,demands,k)
             remaining={i:max(0,int(s.get("channel_count",s.get("antenna_count",20)))) for i,s in enumerate(self.stations)}
-            unmet={int(source):float(value) for source,value in demands.items()};selected=[];used=set();available=set(range(len(candidates)))
+            unmet={int(source):float(value) for source,value in demands.items()}
+            priority_unmet={int(source):min(float(value),unmet.get(int(source),0.)) for source,value in (priority_demands or {}).items()}
+            selected=[];used=set();available=set(range(len(candidates)))
             while available and sum(remaining.values())>0 and sum(unmet.values())>1e-12:
                 evaluated=[]
                 for index in tuple(available):
                     item=candidates[index];gateway=int(item["gateway"]);satellite=int(item["satellite"])
                     if remaining.get(gateway,0)<=0 or satellite in used:continue
-                    capacity=max(0.,float(item["rate_gbps"]));delivered=0.;weighted_delay=0.;allocation=[]
-                    for source,_demand,delay in options[index]:
-                        amount=min(unmet.get(source,0.),capacity-delivered)
-                        if amount<=0:continue
-                        delivered+=amount;weighted_delay+=amount*delay;allocation.append((source,amount,delay))
+                    capacity=max(0.,float(item["rate_gbps"]));delivered=0.;weighted_delay=0.;allocation=[];assigned={};priority_gain=0.;priority_weighted_delay=0.
+                    for priority_pass in (True,False):
+                        for source,_demand,delay in options[index]:
+                            left=max(0.,unmet.get(source,0.)-assigned.get(source,0.))
+                            if priority_pass:left=min(left,priority_unmet.get(source,0.))
+                            amount=min(left,capacity-delivered)
+                            if amount<=0:continue
+                            delivered+=amount;weighted_delay+=amount*delay;allocation.append((source,amount,delay))
+                            assigned[source]=assigned.get(source,0.)+amount
+                            if priority_pass:priority_gain+=amount;priority_weighted_delay+=amount*delay
+                            if delivered>=capacity-1e-12:break
                         if delivered>=capacity-1e-12:break
                     if delivered<=0:continue
                     average_delay=weighted_delay/delivered
                     score,capacity_score,delay_gain,delay_score=_marginal_utility(
                         delivered,average_delay,total_demand,capacity_weight,delay_weight,delay_reference)
                     diversity,minimum_angle,plane_bonus=_candidate_diversity(item,selected,self.config.feeder_diversity_target_deg)
-                    evaluated.append((delivered,score,diversity,minimum_angle,plane_bonus,index,allocation,average_delay,capacity_score,delay_gain,delay_score))
+                    evaluated.append((delivered,score,diversity,minimum_angle,plane_bonus,index,allocation,average_delay,capacity_score,delay_gain,delay_score,priority_gain,priority_weighted_delay))
                 if not evaluated:break
                 # When remaining station slots can cover the unmet business,
                 # let delay and angular diversity decide among useful links.
@@ -647,7 +672,9 @@ class SlowFastLoopPlanner:
                                      +replacement_sum)
                     if row[0]>=max(.1,.5*best_delivery) and row[0]+.85*future_capacity>=unmet_total:
                         feasible.append(row)
-                if self.config.selection_strategy=="window_margin" and not capacity_only:
+                if sum(priority_unmet.values())>1e-9:
+                    eligible=evaluated
+                elif self.config.selection_strategy=="window_margin" and not capacity_only:
                     # In the weighted variant every useful, five-minute-visible
                     # candidate competes; delivery and reserve are outcomes.
                     eligible=feasible if feasible else evaluated
@@ -661,7 +688,16 @@ class SlowFastLoopPlanner:
                 # Keep path quality dominant so dispersion cannot cause a long detour.
                 diversity_weight=.25*delay_weight
                 margin_scores={}
-                if self.config.selection_strategy=="window_margin" and not capacity_only:
+                if sum(priority_unmet.values())>1e-9:
+                    # Nearly equal priority throughput should land through the
+                    # shorter gateway path. An exact max of priority gain made
+                    # tiny rate differences dominate kilometres of detour.
+                    best_priority_gain=max(row[11] for row in eligible)
+                    if best_priority_gain>1e-9:
+                        near_capacity=[row for row in eligible if row[11]+1e-9>=.95*best_priority_gain]
+                        chosen_row=min(near_capacity,key=lambda row:(row[12]/max(row[11],1e-12),-row[11],-row[0]))
+                    else:chosen_row=max(eligible,key=lambda row:(row[0],-row[7]))
+                elif self.config.selection_strategy=="window_margin" and not capacity_only:
                     margins=[max(0.,float(candidates[row[5]].get("window_mean_rate_gbps") or candidates[row[5]]["rate_gbps"])) for row in eligible]
                     qualities=[row[10] for row in eligible]
                     min_margin,max_margin=min(margins),max(margins)
@@ -678,7 +714,7 @@ class SlowFastLoopPlanner:
                 else:
                     chosen_row=max(eligible,key=lambda row:(row[1]+diversity_weight*row[2],
                         row[3]>=self.config.feeder_min_separation_deg,row[1],-row[7]))
-                delivered,score,diversity,minimum_angle,plane_bonus,index,allocation,average_delay,capacity_score,delay_gain,delay_score=chosen_row
+                delivered,score,diversity,minimum_angle,plane_bonus,index,allocation,average_delay,capacity_score,delay_gain,delay_score,priority_gain,_priority_weighted_delay=chosen_row
                 rank=(score+diversity_weight*diversity,delivered,-average_delay,float(candidates[index]["elevation_deg"]))
                 if self.config.selection_strategy=="legacy" and self.config.capacity_weight==0 and self.config.delay_weight==0:
                     rank=(-average_delay if feasible and not capacity_only else delivered,delivered,-average_delay,float(candidates[index]["elevation_deg"]))
@@ -693,10 +729,12 @@ class SlowFastLoopPlanner:
                             delay_gain=round(delay_gain,9),
                             estimated_weighted_delay_ms=round(average_delay,6),assigned_demand_gbps=round(sum(x[1] for x in allocation),6),
                             diversity_score=round(diversity,6),minimum_angular_separation_deg=round(minimum_angle,3),
-                             orbital_plane_bonus=round(plane_bonus,3),selection_reason=("五分钟平均容量与时延加权" if self.config.selection_strategy=="window_margin" else "容量可行集内优先时延"))
+                             orbital_plane_bonus=round(plane_bonus,3),priority_assigned_gbps=round(priority_gain,6),selection_reason=("重点业务优先、可行出口就近" if priority_gain>1e-9 else "五分钟平均容量与时延加权" if self.config.selection_strategy=="window_margin" else "容量可行集内优先时延"))
                 if window_capacity is not None:item["estimated_window_capacity_gbps"]=round(window_capacity,6)
                 selected.append(item);remaining[item["gateway"]]-=1;used.add(item["satellite"]);available.discard(index)
-                for source,amount,_delay in allocation:unmet[source]=max(0.,unmet.get(source,0.)-amount)
+                for source,amount,_delay in allocation:
+                    unmet[source]=max(0.,unmet.get(source,0.)-amount)
+                    priority_unmet[source]=max(0.,priority_unmet.get(source,0.)-amount)
                 available={i for i in available if candidates[i]["satellite"]!=item["satellite"]}
             can_expand=bool(available) and sum(remaining.values())>0
             return selected,sum(unmet.values()),can_expand,unmet
@@ -777,7 +815,7 @@ class SlowFastLoopPlanner:
                 used.discard(int(selected[replace_index]["satellite"]));selected[replace_index]=candidate
             used.add(int(candidate["satellite"]));total+=gain
         return selected,total,total+1e-9>=target
-    def generate(self,t,positions,links,gsls,satellite_traffic,rain_scenario_percentile=None,rain_grade=None,commit=True,window_rates=None):
+    def generate(self,t,positions,links,gsls,satellite_traffic,rain_scenario_percentile=None,rain_grade=None,commit=True,window_rates=None,priority_traffic=None):
         selection_started=time.perf_counter()
         candidates=self._candidates(gsls,t,planning=True,rain_scenario_percentile=rain_scenario_percentile,rain_grade=rain_grade,positions=positions,window_rates=window_rates);demands={int(x[0]):float(x[1])*self.config.traffic_landing_ratio for x in satellite_traffic if float(x[1])>0}
         graph_key=(id(positions),id(links),len(positions),len(links)) if not commit else None
@@ -793,15 +831,15 @@ class SlowFastLoopPlanner:
                 satellite_xyz=_spherical_ecef(row[2],row[3],row[4]);vector=tuple(satellite_xyz[i]-ground[i] for i in range(3));norm=max(1.,math.sqrt(sum(value*value for value in vector)))
                 candidate["los_unit"]=[round(value/norm,9) for value in vector]
                 candidate["plane"]=int(row[1]);candidate["latitude_deg"]=float(row[2]);candidate["longitude_deg"]=float(row[3])
-        for source in demands:
-            row=position_by_id.get(source)
-            if row and any(_surface_distance_km(row[2],row[3],region.get("lat",0),region.get("lon",0))<=max(0.,float(region.get("radius_km",0))) for region in self.config.priority_task_regions):
-                priorities[source]=max(1.,float(self.config.priority_task_weight));priority_sources.add(source)
+        priority_demands={source:min(demand,max(0.,float((priority_traffic or {}).get(source,0.))*self.config.traffic_landing_ratio))
+                          for source,demand in demands.items() if float((priority_traffic or {}).get(source,0.))>0.}
+        for source in priority_demands:
+            priorities[source]=max(1.,float(self.config.priority_task_weight));priority_sources.add(source)
         for x in candidates:x["gsl_distance_km"]=_gsl_distance_km(positions[int(x["satellite"])][4],x["elevation_deg"])
         reserve=max(0.,float(self.config.capacity_reserve_ratio))
         planning_demands=({source:value*(1.+reserve) for source,value in demands.items()}
                           if self.config.selection_strategy!="window_margin" else demands)
-        chosen=self._select(candidates,g,planning_demands)
+        chosen=self._select(candidates,g,planning_demands,priority_demands=priority_demands)
         capacity_target=sum(demands.values())*(1.+reserve)
         chosen,selected_capacity,target_satisfied=self._enforce_capacity_target(
             candidates,chosen,g,planning_demands,capacity_target)
@@ -817,7 +855,7 @@ class SlowFastLoopPlanner:
                        delay_reference_ms=self.config.delay_reference_ms,
                        feeder_gsl_distances=gsl_distances,
                        max_active_exits_per_source=self.config.planning_exit_limit_per_source,
-                       source_priorities=priorities) if chosen else []
+                       source_priorities=priorities,priority_demands=priority_demands) if chosen else []
         # Joint topology/allocation repair.  Link selection precedes routing for
         # performance, so its demand-coverage estimate can still choose feeder
         # links that are globally capacious but unusable by a hotspot after the
@@ -892,13 +930,14 @@ class SlowFastLoopPlanner:
                          capacity_weight=self.config.capacity_weight,delay_weight=self.config.delay_weight,
                          delay_reference_ms=self.config.delay_reference_ms,feeder_gsl_distances=trial_gsl,
                          max_active_exits_per_source=self.config.planning_exit_limit_per_source,
-                         source_priorities=priorities)
+                         source_priorities=priorities,priority_demands=priority_demands)
             old_score,old_delivery,_old_average,_old_p95=repair_objective(routes,gsl_distances)
             new_score,new_delivery,_new_average,_new_p95=repair_objective(trial_routes,trial_gsl)
             joint_repair_score_before=old_score;joint_repair_score_after=new_score
             # Only accept a replacement that delivers more traffic. Path
             # latency ranks feasible exits during routing, not this repair.
-            if new_delivery<=old_delivery+1e-6 or new_score<=old_score+1e-9:break
+            if (new_delivery<=old_delivery+1e-6 or new_score<=old_score+1e-9 or
+                    _priority_delivery(trial_routes,priority_demands)+1e-6<_priority_delivery(routes,priority_demands)):break
             chosen,routes,capacities,gsl_distances=trial,trial_routes,trial_capacities,trial_gsl
             joint_repair_applied=True
         capacity_fallback_used=False
@@ -907,7 +946,7 @@ class SlowFastLoopPlanner:
         if (self.config.selection_strategy!="window_margin" and
                 sum(float(row.get("demand_gbps",0)) for row in routes)<.99*total_business):
             fallback_started=time.perf_counter()
-            conservative=self._select(candidates,g,planning_demands,capacity_only=True)
+            conservative=self._select(candidates,g,planning_demands,capacity_only=True,priority_demands=priority_demands)
             conservative,conservative_capacity,conservative_target=self._enforce_capacity_target(
                 candidates,conservative,g,planning_demands,capacity_target)
             conservative_rates={int(item["satellite"]):float(item["rate_gbps"]) for item in conservative}
@@ -918,9 +957,10 @@ class SlowFastLoopPlanner:
                 delay_reference_ms=self.config.delay_reference_ms,
                 feeder_gsl_distances=conservative_gsl,
                 max_active_exits_per_source=self.config.planning_exit_limit_per_source,
-                source_priorities=priorities) if conservative else []
+                source_priorities=priorities,priority_demands=priority_demands) if conservative else []
             if (sum(float(row.get("demand_gbps",0)) for row in conservative_routes)>
-                    sum(float(row.get("demand_gbps",0)) for row in routes)+1e-6):
+                    sum(float(row.get("demand_gbps",0)) for row in routes)+1e-6 and
+                    _priority_delivery(conservative_routes,priority_demands)+1e-6>=_priority_delivery(routes,priority_demands)):
                 chosen,routes,capacities,gsl_distances=conservative,conservative_routes,conservative_rates,conservative_gsl
                 selected_capacity,target_satisfied=conservative_capacity,conservative_target
                 capacity_fallback_used=True
@@ -928,8 +968,11 @@ class SlowFastLoopPlanner:
         _attach_feeder_delay(routes,chosen);avg,bweighted,delay,p95_delay,max_delay=_route_metrics(routes)
         usage=[{"gateway":i,"used":sum(x["gateway"]==i for x in chosen),"available":int(s.get("channel_count",s.get("antenna_count",20)))} for i,s in enumerate(self.stations)]
         routed_business=sum(float(x.get("demand_gbps",0)) for x in routes);total_business=sum(demands.values())
-        priority_demand=sum(float(demands.get(source,0)) for source in priority_sources)
-        priority_delivered=sum(float(row.get("demand_gbps",0)) for row in routes if int(row.get("source",-1)) in priority_sources)
+        priority_demand=sum(priority_demands.values())
+        delivered_by_source={}
+        for row in routes:
+            source=int(row.get("source",-1));delivered_by_source[source]=delivered_by_source.get(source,0.)+float(row.get("demand_gbps",0))
+        priority_delivered=sum(min(amount,delivered_by_source.get(source,0.)) for source,amount in priority_demands.items())
         delivery_ratio=1.0 if total_business<=1e-12 else min(1.,routed_business/total_business)
         if self.config.selection_strategy=="window_margin":
             load_by_feeder={}
@@ -957,6 +1000,7 @@ class SlowFastLoopPlanner:
           "active_exit_limit_per_source":self.config.planning_exit_limit_per_source,
           "priority_region_count":len(self.config.priority_task_regions),"priority_satellite_count":len(priority_sources),
           "priority_demand_gbps":round(priority_demand,6),"priority_delivered_gbps":round(priority_delivered,6),
+          "priority_demands_by_satellite_gbps":{str(source):round(amount,6) for source,amount in priority_demands.items()},
           "priority_delivery_ratio":round(1. if priority_demand<=1e-12 else min(1.,priority_delivered/priority_demand),6),
           "gateway_count":len({x["gateway"] for x in chosen}),
           "average_hops":avg,"business_weighted_hops":bweighted,"business_propagation_delay_ms":delay,
@@ -1092,20 +1136,22 @@ class SlowFastLoopPlanner:
           "average_hops":avg,"business_weighted_hops":bweighted,"business_propagation_delay_ms":delay,
           "p95_propagation_delay_ms":p95_delay,"maximum_propagation_delay_ms":max_delay,"latency_scope":"服务卫星至信关站（ISL+馈电GSL）",
           "route_count":len(valid),"routed_source_count":len(routed_sources),"routes":valid}
-    def update(self,t,positions,links,gsls,satellite_traffic):
+    def update(self,t,positions,links,gsls,satellite_traffic,priority_traffic=None):
         update_started=time.perf_counter();route_rebuild_ms=0.;adjustment_ms=0.;route_rebuild_mode="无"
         first_plan=not self.state.plans
         if self.config.offline_mode and first_plan:
             raise RuntimeError("尚未加载离线规划方案，请先执行离线规划")
         due=(not self.config.offline_mode) and (first_plan or t<self.state.generated_at_s or t-self.state.generated_at_s>=self.config.planning_period_s)
         planning_reason="首次生成慢周期资源方案" if first_plan else ("到达滚动规划周期" if due else "未到规划周期，沿用当前方案")
-        if due:self.generate(t,positions,links,gsls,satellite_traffic)
+        if due:self.generate(t,positions,links,gsls,satellite_traffic,priority_traffic=priority_traffic)
         evaluation_due=due or self.state.last_result is None or t<self.state.last_evaluation_s or t-self.state.last_evaluation_s>=self.config.fast_evaluation_period_s
         if not evaluation_due:
             result=dict(self.state.last_result);result["planning_event"]=False;result["scheduling_event"]=False;result["planning_reason"]="未到规划周期，沿用当前方案";result["connection_change_count"]=0
             return result
         pairs={(int(g),int(s)):float(e) for g,s,e in gsls};edges={(min(int(a),int(b)),max(int(a),int(b))) for a,b,*_ in links};access_demand=sum(float(x[1]) for x in satellite_traffic);demand=access_demand*self.config.traffic_landing_ratio
         demands={int(x[0]):float(x[1])*self.config.traffic_landing_ratio for x in satellite_traffic if float(x[1])>0}
+        priority_demands={source:min(value,max(0.,float((priority_traffic or {}).get(source,0.))*self.config.traffic_landing_ratio))
+                          for source,value in demands.items() if float((priority_traffic or {}).get(source,0.))>0.}
         current_source_count=len(demands);slow_plan=self.state.plans[0];plan=self.state.execution_plan or slow_plan
         if any(int(row.get("source",-1)) not in demands for row in plan.get("routes",[])):
             plan=plan.copy();plan["routes"]=[row for row in plan.get("routes",[]) if int(row.get("source",-1)) in demands]
@@ -1114,11 +1160,12 @@ class SlowFastLoopPlanner:
         route_broken=bool(plan.get("routes")) and active["route_count"]<len(plan["routes"])
         new_sources=set(demands)-self.state.last_route_sources
         demand_changed=(set(demands)!=set(self.state.last_demands) or any(abs(float(value)-float(self.state.last_demands.get(source,0)))>1e-6 for source,value in demands.items()))
+        priority_changed=priority_demands!=getattr(self,"_last_priority_demands",{})
         route_capacity_missing=float(active.get("route_capacity_gap_gbps",0))>1e-3
         current_feeder_capacities={int(row["satellite"]):round(float(row.get("rate_gbps",0)),6)
                                    for row in active.get("active_links",[])}
         feeder_capacity_changed=current_feeder_capacities!=self.state.last_feeder_capacities
-        route_needs_repair=route_broken or bool(new_sources) or demand_changed or route_capacity_missing
+        route_needs_repair=route_broken or bool(new_sources) or demand_changed or priority_changed or route_capacity_missing
         graph=None
         fast_epoch=int(math.floor(t/max(self.config.fast_adjust_period_s,1e-6)))
         fast_tick=fast_epoch>self.state.last_fast_epoch
@@ -1134,26 +1181,29 @@ class SlowFastLoopPlanner:
             # any retained ISL route can use that feeder's capacity.
             old_local={int(row["source"]):row for row in active.get("routes",[])
                        if int(row.get("source",-1))==int(row.get("feeder",-2))}
-            for source in sorted(set(source_left)&set(feeder_left)):
-                amount=min(source_left[source],feeder_left[source])
+            for source in sorted(set(source_left)&set(feeder_left),key=lambda source:priority_demands.get(source,0.),reverse=True):
+                amount=min(source_left[source],feeder_left[source],priority_demands.get(source,0.)) if priority_demands else min(source_left[source],feeder_left[source])
                 if amount<=1e-9:continue
                 row=old_local.get(source,{"source":source,"feeder":source,"path":[source],"hops":0,
                     "distance_km":0.,"isl_propagation_delay_ms":0.,"propagation_delay_ms":0.}).copy()
                 row["demand_gbps"]=round(amount,6)
                 retained.append(row);source_left[source]-=amount;feeder_left[source]-=amount
                 existing_exits.setdefault(source,set()).add(source)
-            for original in active.get("routes",[]):
+            for original in sorted(active.get("routes",[]),key=lambda row:priority_demands.get(int(row.get("source",-1)),0.),reverse=True):
                 source=int(original.get("source",-1));feeder=int(original.get("feeder",-1))
-                amount=min(float(original.get("demand_gbps",0)),source_left.get(source,0.),feeder_left.get(feeder,0.))
+                if priority_demands.get(source,0.)>1e-9:continue
+                priority_left=max(0.,priority_demands.get(source,0.)-(demands.get(source,0.)-source_left.get(source,0.)))
+                amount=min(float(original.get("demand_gbps",0)),source_left.get(source,0.),feeder_left.get(feeder,0.),priority_left) if priority_demands else min(float(original.get("demand_gbps",0)),source_left.get(source,0.),feeder_left.get(feeder,0.))
                 if amount<=1e-9:continue
                 row=original.copy();row["demand_gbps"]=round(amount,6);retained.append(row)
                 source_left[source]-=amount;feeder_left[feeder]-=amount
                 existing_exits.setdefault(source,set()).add(feeder)
             # Business changes every second. Fill the increment on an already
             # valid path before launching any new graph search.
-            for row in retained:
+            for row in sorted(retained,key=lambda row:priority_demands.get(int(row.get("source",-1)),0.),reverse=True):
                 source=int(row["source"]);feeder=int(row["feeder"])
-                increment=min(source_left.get(source,0.),feeder_left.get(feeder,0.))
+                priority_left=max(0.,priority_demands.get(source,0.)-(demands.get(source,0.)-source_left.get(source,0.)))
+                increment=min(source_left.get(source,0.),feeder_left.get(feeder,0.),priority_left) if priority_demands else min(source_left.get(source,0.),feeder_left.get(feeder,0.))
                 if increment<=1e-9:continue
                 row["demand_gbps"]=round(float(row["demand_gbps"])+increment,6)
                 source_left[source]-=increment;feeder_left[feeder]-=increment
@@ -1165,10 +1215,11 @@ class SlowFastLoopPlanner:
                 feeder_components={components[feeder] for feeder in search_capacities}
                 repair_demands={source:amount for source,amount in repair_demands.items()
                                 if components[source] in feeder_components}
-                repaired=_repair_routes_local(graph,repair_demands,search_capacities,gsl_distances,
+                repaired=_repair_routes_local(graph,dict(sorted(repair_demands.items(),key=lambda item:priority_demands.get(item[0],0.),reverse=True)),search_capacities,gsl_distances,
                     1.,0.,self.config.delay_reference_ms,excluded_feeders=existing_exits,
                     exit_limits={source:max(0,self.config.realtime_exit_limit_per_source-len(existing_exits.get(source,set()))) for source in repair_demands},
-                    max_visited_per_source=500,max_exits_per_source=self.config.realtime_exit_limit_per_source)
+                    max_visited_per_source=500,max_exits_per_source=self.config.realtime_exit_limit_per_source,
+                    priority_demands=priority_demands)
             else:repaired=[]
             new_routes=_compact_routes(retained+repaired,demands,self.config.realtime_exit_limit_per_source)
             plan=plan.copy();plan["routes"]=new_routes
@@ -1191,6 +1242,7 @@ class SlowFastLoopPlanner:
         if not route_needs_repair:
             self.state.last_demands=dict(demands)
             self.state.last_feeder_capacities=dict(current_feeder_capacities)
+        self._last_priority_demands=dict(priority_demands)
         threshold=self.config.capacity_threshold_ratio
         demand_ratio=active["unserved_gbps"]/max(demand,1e-12) if active else 1.
         # Persistent demand above the installed radio/path capacity is a
@@ -1204,7 +1256,7 @@ class SlowFastLoopPlanner:
         # configured slow-planning epochs.
         severe=False
         if not due and severe and t-self.state.generated_at_s>=self.config.freeze_window_s:
-            self.generate(t,positions,links,gsls,satellite_traffic);slow_plan=self.state.plans[0];plan=self.state.execution_plan or slow_plan
+            self.generate(t,positions,links,gsls,satellite_traffic,priority_traffic=priority_traffic);slow_plan=self.state.plans[0];plan=self.state.execution_plan or slow_plan
             active=self._evaluate(t,plan,pairs,demand,edges,current_source_count,positions);due=True;planning_reason="到达慢规划周期";action="执行慢周期全局重规划"
         pairs_now={(x["gateway"],x["satellite"]) for x in (active["active_links"] if active else [])}
         change_count=len(pairs_now.symmetric_difference(self.state.last_scheduled_pairs)) if self.state.last_scheduled_pairs else 0;changed=change_count>0
@@ -1223,6 +1275,13 @@ class SlowFastLoopPlanner:
         for route in (active or {}).get("routes",[]):
             source=int(route.get("source",-1));route_exits_by_source.setdefault(source,set()).add(int(route.get("feeder",-1)))
             allocated_by_source[source]=allocated_by_source.get(source,0.)+float(route.get("demand_gbps",0))
+        priority_demand=sum(priority_demands.values())
+        priority_delivered=sum(min(amount,allocated_by_source.get(source,0.)) for source,amount in priority_demands.items())
+        priority_delay_amount=0.;priority_delay_total=0.;priority_left=dict(priority_demands)
+        for route in (active or {}).get("routes",[]):
+            source=int(route.get("source",-1));amount=min(priority_left.get(source,0.),float(route.get("demand_gbps",0.)))
+            priority_delay_total+=amount*float(route.get("propagation_delay_ms",0.))
+            priority_delay_amount+=amount;priority_left[source]=max(0.,priority_left.get(source,0.)-amount)
         maximum_active_exits=max((len(value) for value in route_exits_by_source.values()),default=0)
         underallocated_sources=sorted(source for source,value in demands.items() if allocated_by_source.get(source,0.)+1e-6<value)
         underallocated_business=sum(max(0.,float(demands[source])-allocated_by_source.get(source,0.)) for source in underallocated_sources)
@@ -1242,6 +1301,9 @@ class SlowFastLoopPlanner:
         decision_context={
           "access_traffic_gbps":round(access_demand,6),"landing_ratio":round(self.config.traffic_landing_ratio,6),
           "traffic_demand_gbps":round(demand,6),"traffic_satellite_count":len(satellite_traffic),
+          "priority_demand_gbps":round(priority_demand,6),"priority_delivered_gbps":round(priority_delivered,6),
+          "priority_delivery_ratio":round(priority_delivered/max(priority_demand,1e-12),6) if priority_demand else 1.,
+          "priority_average_delay_ms":round(priority_delay_total/max(priority_delay_amount,1e-12),4) if priority_delay_amount else 0.,
           "isl_count":len(links),"gsl_candidate_count":len(gsls),
           "visible_feeder_satellite_count":len({int(x[1]) for x in gsls}),
           "gateway_count":len(self.stations),"planned_link_count":len(plan.get("links",[])),
