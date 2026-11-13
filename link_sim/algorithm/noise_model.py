@@ -12,6 +12,7 @@ from .noise_core import generate_noise
 
 class NoiseModelDialog(ModuleDialog):
     MODEL_KIND = "noise"
+    MODEL_FILE_ACTIONS = False
     TITLE = "底噪模型"
 
     def build_content(self, layout):

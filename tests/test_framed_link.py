@@ -96,10 +96,12 @@ class FramedLinkTests(unittest.TestCase):
         next(s for s in stages if s.kind == "fastica").settings["window_length"] = "invalid"
         edges = [e for e in edges if not (len(e) == 4 and e[1] == "fastica" and e[3] == 1)]
         outputs = run_graph(stages, edges, target="xpic")
-        self.assertEqual(len(outputs), 20)
+        self.assertEqual(len(outputs), 18)
         self.assertIn("A_frame_source", outputs)
         self.assertIn("B_frame_source", outputs)
         self.assertIn("xpic::B", outputs)
+        self.assertNotIn("dual_channel", outputs)
+        self.assertNotIn("dual_channel::B", outputs)
         self.assertNotIn("fastica", outputs)
         with self.assertRaises(ValueError):
             run_graph(stages, [e for e in edges if not (len(e) == 4 and e[1] == "xpic" and e[3] == 1)], target="xpic")
@@ -190,7 +192,6 @@ class FramedLinkTests(unittest.TestCase):
 
     def test_single_channel_recovers_bits_and_receiver_uses_no_payload_truth(self):
         stages, edges, _ = configured_link()
-        next(s for s in stages if s.kind == "channel").settings.update(delay=.5, offset_hz=100., snr_db=35.)
         out = run_graph(stages, edges)
         received = out["A_sink"]
         np.testing.assert_array_equal(received.decoded_bits, out["A_frame_source"].context.bits)
@@ -206,13 +207,42 @@ class FramedLinkTests(unittest.TestCase):
             with np.load(path) as data:
                 np.testing.assert_array_equal(data["receivedBits"], received.decoded_bits)
 
+    def test_awgn_uses_measured_power_and_preserves_sample_grid(self):
+        from link_sim.algorithm.waveform_chain import Wave
+
+        signal = 2.5 * np.exp(2j*np.pi*np.arange(65536)/32)
+        inputs = [Wave(signal, 2.8e9, start=4, stop=len(signal)-4),
+                  Wave(signal/5, 2.8e9)]
+        settings = dict(snr_db=20., gain_db=-6., offset_hz=100., delay=10.)
+        single = process_stage(Stage("single", "channel", "无线信道", settings), inputs[0])
+        pair = process_dual_stage(Stage("dual", "dual_channel", "无线信道", settings), inputs)
+        for source, output in zip([inputs[0], *inputs], [single, *pair]):
+            noise = output.x - source.x
+            measured_snr = 10*np.log10(np.mean(abs(source.x)**2)/np.mean(abs(noise)**2))
+            self.assertAlmostEqual(measured_snr, 20., delta=.15)
+            self.assertEqual((output.fs, output.start, output.stop), (source.fs, source.start, source.stop))
+        noise_a, noise_b = (output.x - source.x for source, output in zip(inputs, pair))
+        correlation = abs(np.vdot(noise_a, noise_b))/(np.linalg.norm(noise_a)*np.linalg.norm(noise_b))
+        self.assertLess(correlation, .02)
+
     def test_dual_channel_ports_scheme_and_joint_bypass(self):
         stages, edges, positions = configured_link(True)
         next(s for s in stages if s.kind == "xpic").settings["delay_b"] = .5
         with tempfile.TemporaryDirectory() as folder:
             path = Path(folder)/"dual.json"
             save_chain(path, stages, edges, positions)
-            stages, edges, _ = load_chain(path)
+            stages, edges, positions = load_chain(path)
+        _, parents = order_graph(stages, edges)
+        channel = "dual_channel"
+        self.assertEqual([s.key for s in stages if s.kind in ("channel", "dual_channel")], [channel])
+        for port, lane in enumerate(("A", "B")):
+            with self.subTest(lane=lane):
+                self.assertEqual(parents["xpic"][port], (f"{lane}_pa", 0))
+                self.assertEqual(parents[channel][port], ("xpic", port))
+                self.assertEqual(parents["fastica"][port], (channel, port))
+                self.assertEqual(parents[f"{lane}_downmixer"][0], ("fastica", port))
+                self.assertLess(positions["xpic"][0], positions[channel][0])
+                self.assertLess(positions[channel][0], positions["fastica"][0])
         out = run_graph(stages, edges)
         for lane in ("A", "B"):
             with self.subTest(lane=lane):
@@ -220,8 +250,8 @@ class FramedLinkTests(unittest.TestCase):
                                               out[lane+"_frame_source"].context.bits)
         self.assertFalse(np.array_equal(out["A_sink"].decoded_bits, out["B_sink"].decoded_bits))
         bypass = process_dual_stage(Stage("f", "fastica", "旁路", enabled=False),
-                                    [out["xpic"], out["xpic::B"]])
-        for actual, key in zip(bypass, ("xpic", "xpic::B")):
+                                    [out[channel], out[channel+"::B"]])
+        for actual, key in zip(bypass, (channel, channel+"::B")):
             np.testing.assert_array_equal(actual.x, out[key].x)
         # Both input ports are required, and a two-port round-trip must preserve B.
         with self.assertRaises(ValueError):

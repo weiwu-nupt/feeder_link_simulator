@@ -307,14 +307,29 @@ class WaveformWorkspaceTests(unittest.TestCase):
         self.app.processEvents()
         w.fit_canvas()
         w.graph.widget.grab()
-        self.assertEqual(len(w.graph.all_nodes()), 34)
+        self.assertEqual(len(w.graph.all_nodes()), 33)
+        channel, = [node for node in w.graph.all_nodes() if node.KIND in ("channel", "dual_channel")]
+        self.assertEqual(channel.name(), "无线信道")
+        self.assertEqual((len(channel.input_ports()), len(channel.output_ports())), (2, 2))
         for node in w.graph.all_nodes():
             self.assertTrue(node.view.text_item.isVisible(), node.name())
-            if node.KIND not in ("xpic", "fastica"):
+            if node.KIND not in ("xpic", "dual_channel", "fastica"):
                 self.assertRegex(node.name(), r"^[AB] · ")
             if node.KIND == "lowpass":
                 self.assertRegex(node.view.text_item.toPlainText(), r"^[AB] · 低通滤波$")
         self.assertEqual(w.point.count(), 6)
+        labels = {button.text() for button in w.findChildren(QPushButton) if button.isVisibleTo(w)}
+        self.assertFalse(labels & {"添加模块", "配置所选…", "删除所选", "1:1", "取消"})
+        self.assertTrue({"重建收发链路", "适应画布", "打开方案…", "保存方案…",
+                         "计算所选输出", "运行完整链路"} <= labels)
+        for kind in ("channel", "dual_channel"):
+            dialog = StageDialog(Stage("ch", kind, "无线信道", dict(snr_db=12., delay=4.)), w)
+            try:
+                self.assertEqual(set(dialog.fields), {"snr_db"})
+                dialog.accept()
+                self.assertEqual(dialog.stage.settings, {"snr_db": 12.})
+            finally:
+                dialog.deleteLater()
 
     def test_node_caption_pair_and_bypass_preserve_module_name(self):
         from test_filter_inverse import lowpass

@@ -334,6 +334,7 @@ def _form_row(form, label, default, hint="", w=140, low=1, high=64):
 # ══════════════════════════════════════════════════════════
 
 class PAModelDialog(ModuleDialog):
+    MODEL_FILE_ACTIONS = False
     MODEL_KIND   = "pa"
     TITLE        = "功放建模与仿真"
     ACCENT_COLOR = "#22C7E6"

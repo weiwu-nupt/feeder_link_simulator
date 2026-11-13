@@ -9,6 +9,7 @@ from link_sim.ui.styles import light_palette
 
 class ModuleDialog(QDialog):
     MODEL_KIND   = None
+    MODEL_FILE_ACTIONS = True
     TITLE        = "模块"
     SUBTITLE     = ""
     ACCENT_COLOR = "#00CFE8"
@@ -47,7 +48,7 @@ class ModuleDialog(QDialog):
         self.build_content(wlay)
         if self.MODEL_KIND is not None:
             from link_sim.ui.model_library import ModelActions
-            self.model_actions = ModelActions(self)
+            self.model_actions = ModelActions(self, file_actions=self.MODEL_FILE_ACTIONS)
             wlay.insertWidget(0, self.model_actions)
 
         if wlay.count() == 0:

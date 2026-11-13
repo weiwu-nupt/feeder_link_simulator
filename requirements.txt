@@ -21,6 +21,14 @@ h3>=4.5.0
 rasterio>=1.4.3
 psutil>=7.2.2
 
+# Bundled satgen imports these when the constellation simulator starts.
+astropy>=8.0.2
+Cartopy>=0.26.0
+exputil>=1.9.2
+geopy>=2.5.0
+networkx>=3.5
+statsmodels>=0.15.0
+
 # Excel, MATLAB and tabular data export.
 openpyxl>=3.1.5
 h5py>=3.16.0

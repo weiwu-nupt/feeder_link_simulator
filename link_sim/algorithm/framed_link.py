@@ -115,7 +115,6 @@ def process_framed_stage(stage, wave):
     from .waveform_chain import Wave, _number
     from .burst_link.receive_filtering import RRCMatchedFilter
     from .burst_link.interpolation import FractionalInterpolator
-    from .burst_link.channel.geo_wideband import GEOWidebandChannel
 
     c, p = wave.context, stage.settings
     if stage.kind in ("rrc_tx", "rrc_rx", "sync", "sink") and c is None:
@@ -162,14 +161,14 @@ def process_framed_stage(stage, wave):
                     notes=(f"帧头相位/幅度恢复，各业务帧按各自调制编码软解调及译码；误码 {errors}/{len(bits)}，"
                            f"BER={errors/len(bits):.4g}；业务符号 EVM={100*evm:.3f}%",))
     if stage.kind == "channel":
-        channel = GEOWidebandChannel(sample_rate_hz=wave.fs, filter_taps=[1.],
-            delay_samples=_number(p, "delay", 0., 0., 4096.),
-            frequency_offset_hz=_number(p, "offset_hz", 0., -wave.fs/2+1, wave.fs/2-1),
-            amplitude=10**(_number(p, "gain_db", 0., -100., 100.)/20))
-        x = channel(tensor(wave.x)).numpy()
-        x = add_noise(x, p, 2026 + (c.lane if c is not None else 0))
-        return Wave(x, wave.fs, wave.carrier_hz, context=c, notes=("无线信道含接收窗口保护、增益、频偏、短时延及复高斯噪声",))
+        return wireless_channel(wave, p, seed=2026 + (c.lane if c is not None else 0))
     raise ValueError("未知收发模块")
+
+
+def wireless_channel(wave, settings, *, seed):
+    # MATLAB awgn(x, snr, 'measured') uses the mean power of the input samples.
+    return replace(wave, x=add_noise(wave.x, settings, seed), added_error=None,
+                   notes=("AWGN：按输入波形平均功率叠加复高斯白噪声",))
 
 
 def add_noise(x, settings, seed):
@@ -192,6 +191,8 @@ def process_dual_stage(stage, inputs):
         return [Wave(w.x.copy(), w.fs, w.carrier_hz, w.start, w.stop, ("双路模块已旁路",), context=w.context)
                 for w in inputs]
     p = stage.settings
+    if stage.kind == "dual_channel":
+        return [wireless_channel(wave, p, seed=2026+port) for port, wave in enumerate(inputs)]
     if stage.kind == "xpic":
         channel = DualPolarizationChannel(sample_rate_hz=a.fs, filter_taps=[1.],
             xpd_db=(_number(p, "xpd_a", 10., 0., 100.), _number(p, "xpd_b", 10., 0., 100.)),

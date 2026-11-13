@@ -24,13 +24,15 @@ KINDS = {"source": "基带信号源", "dpd": "数字预失真（DPD）", "dac": 
          "mixer": "上变频器", "pa": "功率放大器", "gain": "增益",
          "frequency": "频率偏移", "awgn": "加性白噪声"}
 KINDS.update(noise="底噪模型", frame_source="按帧发射信号", rrc_tx="发射 RRC", channel="无线信道",
-             xpic="交叉极化信道（XPIC）", fastica="FastICA 双路分离", downmixer="下变频器",
+             xpic="交叉极化信道（XPIC）", dual_channel="无线信道（双路）",
+             fastica="FastICA 双路分离", downmixer="下变频器",
              rx_adc="接收 ADC", rrc_rx="接收 RRC", sync="同步模块", sink="接收信号")
 KINDS.update(precomp="预补偿", lowpass="低通滤波")
 DEVICE_KINDS = {"noise": "noise","dpd": "dpd", "dac": "adda", "rx_adc": "adda", "filter": "filter",
                 "mixer": "mixer", "downmixer": "mixer", "pa": "pa", "rrc_tx": "filter", "rrc_rx": "filter",
                 "precomp": "filter", "lowpass": "filter"}
-DUAL_KINDS = ("xpic", "fastica")
+DUAL_KINDS = ("xpic", "dual_channel", "fastica")
+AWGN_CHANNEL_KINDS = ("channel", "dual_channel")
 SOURCE_KINDS = ("source", "frame_source")
 OBSERVATION_KINDS = (*SOURCE_KINDS, "pa", "sink")
 
@@ -92,13 +94,14 @@ def _number(settings, key, default, low=None, high=None, integer=False):
 def default_settings(kind):
     if kind in DEVICE_KINDS:
         return {}
+    if kind in AWGN_CHANNEL_KINDS:
+        return dict(snr_db=35.)
     return {
         "source": dict(fs=100e6, count=16384, sps=8, amplitude=.2, seed=2025, modulation="QPSK"),
         "frame_source": dict(symbol_rate=700e6, seed=0, lane=0, segments=4,
                              payload_symbols=1024, header_hex="1ACFFC1D"),
         "rrc_tx": {}, "rrc_rx": {}, "sink": {},
         "sync": dict(threshold=.4),
-        "channel": dict(snr_db=35., gain_db=0., offset_hz=0., delay=0.),
         "xpic": dict(snr_db=35., xpd_a=10., xpd_b=10., delay_a=0., delay_b=0.),
         "fastica": dict(window_offset=4500, window_length=3000),
         "gain": dict(gain_db=0.),
@@ -109,7 +112,9 @@ def default_settings(kind):
 
 def default_link(dual=False):
     stages, edges, positions = [], [], {}
-    tx = ("frame_source", "rrc_tx", "dpd", "tx_precomp", "dac", "dac_lowpass", "mixer", "pa", "channel")
+    tx = ("frame_source", "rrc_tx", "dpd", "tx_precomp", "dac", "dac_lowpass", "mixer", "pa")
+    if not dual:
+        tx += ("channel",)
     rx = ("downmixer", "rx_precomp", "rx_adc", "adc_lowpass", "rrc_rx", "sync", "sink")
     special = dict(tx_precomp=("precomp", "发射预补偿"), dac_lowpass=("lowpass", "低通滤波"),
                    rx_precomp=("precomp", "接收预补偿"), adc_lowpass=("lowpass", "低通滤波"))
@@ -126,21 +131,24 @@ def default_link(dual=False):
             if suffix in paired:
                 settings["paired_node"] = f"{lane}_{paired[suffix]}"
             stages.append(Stage(key, kind, f"{lane} · {label}" if dual else label, settings))
-            x = column*180 + (360 if dual and column >= len(tx) else 0)
-            positions[key] = [x, lane_index*300]
+            if dual and column >= len(tx):
+                column += len(DUAL_KINDS)
+            positions[key] = [column*180, lane_index*300]
             if previous and not (dual and kind == "downmixer"):
                 edges.append((previous, key))
             previous = key
     if dual:
-        for column, kind in enumerate(DUAL_KINDS):
+        for column, kind in enumerate(DUAL_KINDS, start=len(tx)):
             settings = default_settings(kind)
             if kind == "xpic":
                 settings["snr_db"] = 200.
-            stages.append(Stage(kind, kind, KINDS[kind], settings))
-            positions[kind] = [(len(tx)+column)*180, 150]
+            label = KINDS["channel"] if kind == "dual_channel" else KINDS[kind]
+            stages.append(Stage(kind, kind, label, settings))
+            positions[kind] = [column*180, 150]
         for port, lane in enumerate(lanes):
-            edges.extend(((f"{lane}_channel", "xpic", 0, port),
-                          ("xpic", "fastica", port, port),
+            edges.extend(((f"{lane}_pa", "xpic", 0, port),
+                          ("xpic", "dual_channel", port, port),
+                          ("dual_channel", "fastica", port, port),
                           ("fastica", f"{lane}_downmixer", port, 0)))
     return stages, edges, positions
 
@@ -468,6 +476,8 @@ def model_from_dict(data):
 def save_chain(path, stages, edges, positions):
     order_graph(stages, edges)
     def portable_settings(stage):
+        if stage.kind in AWGN_CHANNEL_KINDS:
+            return dict(snr_db=stage.settings.get("snr_db", 35.))
         if stage.kind != "frame_source":
             return stage.settings
         from .frame_config import frame_plan, portable_code, legacy_frame
@@ -511,6 +521,8 @@ def load_chain(path):
         if not isinstance(enabled, bool):
             raise ValueError("模块开关状态无效")
         stage = Stage(n["key"], n["kind"], n["name"], n["settings"], model_from_dict(n.get("model")), enabled)
+        if stage.kind in AWGN_CHANNEL_KINDS:
+            stage.settings = dict(snr_db=stage.settings.get("snr_db", 35.))
         if stage.kind == "source":
             source_wave(stage.settings)
         elif stage.model and stage.model.kind != DEVICE_KINDS.get(stage.kind):

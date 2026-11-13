@@ -254,6 +254,7 @@ class PlotCanvas(FigureCanvas):
 
 class ADDAModelDialog(ModuleDialog):
     MODEL_KIND = "adda"
+    MODEL_FILE_ACTIONS = False
     """ADC：量化位数和多杂散输入的行为模型界面。"""
 
     TITLE = "ADC/DAC 模型"

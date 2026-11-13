@@ -252,15 +252,17 @@ class ModelLibraryDialog(QDialog):
 
 
 class ModelActions(QWidget):
-    def __init__(self, owner):
+    def __init__(self, owner, *, file_actions=True):
         super().__init__(owner)
         self.owner = owner
         row = QHBoxLayout(self)
         row.setContentsMargins(0, 0, 0, 6)
-        for name, label, action in (("save_button", "保存到模型库", self.save),
-                                    ("load_button", "从模型库加载", self.load),
-                                    ("import_button", "导入模型文件", self.import_file),
-                                    ("export_button", "导出模型文件", self.export_file)):
+        actions = [("save_button", "保存到模型库", self.save),
+                   ("load_button", "从模型库加载", self.load)]
+        if file_actions:
+            actions.extend((("import_button", "导入模型文件", self.import_file),
+                            ("export_button", "导出模型文件", self.export_file)))
+        for name, label, action in actions:
             button = QPushButton(label)
             button.setMinimumHeight(30)
             button.clicked.connect(action)

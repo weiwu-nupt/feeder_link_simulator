@@ -24,7 +24,8 @@ except ImportError as exc:
                       "python -m pip install --upgrade -r requirements.txt") from exc
 
 from link_sim.algorithm.waveform_chain import (
-    Stage, Wave, KINDS, DEVICE_KINDS, DUAL_KINDS, SOURCE_KINDS, OBSERVATION_KINDS, MAX_SAMPLES, default_link,
+    Stage, Wave, KINDS, DEVICE_KINDS, DUAL_KINDS, AWGN_CHANNEL_KINDS, SOURCE_KINDS,
+    OBSERVATION_KINDS, MAX_SAMPLES, default_link,
     default_settings, edge_parts, export_wave, output_key, upstream_graph,
     import_source, load_chain, model_from_dict, model_to_dict, order_graph,
     run_graph, save_chain, source_wave,
@@ -115,6 +116,10 @@ class ChannelNode(SignalNode):
     NODE_NAME, KIND = "无线信道", "channel"
 
 
+class DualChannelNode(SignalNode):
+    NODE_NAME, KIND = "无线信道（双路）", "dual_channel"
+
+
 class XPICNode(SignalNode):
     NODE_NAME, KIND = "交叉极化信道（XPIC）", "xpic"
 
@@ -145,7 +150,7 @@ class ReceiverNode(SignalNode):
 
 NODE_CLASSES = {cls.KIND: cls for cls in (
     SourceNode, DPDNode, DACNode, FilterNode, PrecompensationNode, LowpassNode, MixerNode, PANode, GainNode, FrequencyNode, NoiseNode, NoiseFloorNode,
-    FramedSourceNode, TransmitRRCNode, ChannelNode, XPICNode, FastICANode, DownmixerNode,
+    FramedSourceNode, TransmitRRCNode, ChannelNode, DualChannelNode, XPICNode, FastICANode, DownmixerNode,
     ReceiveADCNode, ReceiveRRCNode, SynchronizationNode, ReceiverNode)}
 
 
@@ -158,10 +163,7 @@ FIELDS = {
     "rrc_tx": (),
     "rrc_rx": (), "sink": (),
     "sync": (("threshold", "同步相关门限", 1, .01, 1, 3),),
-    "channel": (("snr_db", "接收窗口 SNR (dB)", 1, -40, 200, 2),
-                ("gain_db", "路径增益 (dB)", 1, -100, 100, 2),
-                ("offset_hz", "残余频偏 (kHz)", 1e3, -1e6, 1e6, 3),
-                ("delay", "窗口时延（采样）", 1, 0, 4096, 3)),
+    "channel": (("snr_db", "信噪比 SNR (dB)", 1, -40, 200, 2),),
     "xpic": (("xpd_a", "发射 A 极化 XPD (dB)", 1, 0, 100, 2),
              ("xpd_b", "发射 B 极化 XPD (dB)", 1, 0, 100, 2),
              ("delay_a", "A 相对时延（采样）", 1, 0, 4096, 3),
@@ -179,6 +181,7 @@ FIELDS = {
     "awgn": (("snr_db", "输入信噪比 (dB)", 1, -40, 200, 3),
              ("seed", "随机种子", 1, 0, 2**32-1, 0)),
 }
+FIELDS["dual_channel"] = FIELDS["channel"]
 
 
 class StageDialog(QDialog):
@@ -351,7 +354,8 @@ class StageDialog(QDialog):
                 "rrc_rx": "使用帧约定的 RRC 抽头完成接收匹配滤波。",
                 "sync": "根据接收波形与已知同步头进行相关检测及小数定时插值。",
                 "sink": "帧头辅助恢复相位与幅度，软解调并译码，输出接收比特、BER 和 EVM。",
-                "channel": "复包络路径增益、短时延、残余频偏及接收复高斯噪声。",
+                "channel": "AWGN 信道按输入波形的平均功率和设定信噪比叠加复高斯白噪声。",
+                "dual_channel": "A/B 两路共用信噪比，各自按输入平均功率叠加独立的复高斯白噪声。",
                 "xpic": "双路共享时间轴；2×2 交叉极化耦合。XPD 按发射 A/B 极化分别配置。",
                 "fastica": "两路联合估计复数瞬时分离矩阵；以已知同步头定位训练窗口。\n"
                            "适用于近似独立、非高斯源及瞬时满秩混合；退化或未收敛时报告失败。",
@@ -430,6 +434,8 @@ class StageDialog(QDialog):
         settings.pop("model_revision", None)
         if self.stage.kind in DEVICE_KINDS:
             settings = {"paired_node": settings["paired_node"]} if settings.get("paired_node") else {}
+        elif self.stage.kind in AWGN_CHANNEL_KINDS:
+            settings = {}
         for key, (edit, scale, decimals) in self.fields.items():
             value = edit.value()*scale
             settings[key] = int(value) if decimals == 0 else value
@@ -503,23 +509,16 @@ class WaveformWorkspace(QDialog):
         self._syncing_pair = False
         self._shown_once = False
         root = QVBoxLayout(self)
-        root.setContentsMargins(10, 8, 10, 8)
-        heading = QLabel("全链路仿真  /  单通道与双极化收发")
-        heading.setStyleSheet("font-size:18px;font-weight:600;color:#d5f3fa;padding:5px")
-        root.addWidget(heading)
+        root.setContentsMargins(12, 10, 12, 8)
+        root.setSpacing(8)
         self.edit_row = QWidget()
         controls = QHBoxLayout(self.edit_row)
         controls.setContentsMargins(0, 0, 0, 0)
-        self.palette = QComboBox()
-        for kind, label in KINDS.items():
-            self.palette.addItem(label, kind)
-        controls.addWidget(self.palette)
+        controls.setSpacing(8)
+        controls.addWidget(QLabel("收发模式"))
         self.link_mode = QComboBox()
-        self.link_mode.addItems(["单通道", "双通道 A / B（XPIC + FastICA）"])
+        self.link_mode.addItems(["单通道", "双极化 A / B"])
         controls.addWidget(self.link_mode)
-        self._button(controls, "添加模块", self.add_selected_kind)
-        self._button(controls, "配置所选…", self.configure_selected)
-        self._button(controls, "删除所选", self.delete_selected)
         self._button(controls, "重建收发链路", self.reset_chain)
         self._button(controls, "适应画布", self.fit_canvas)
         controls.addStretch()
@@ -527,15 +526,15 @@ class WaveformWorkspace(QDialog):
         self._button(controls, "保存方案…", self.save_scheme)
         root.addWidget(self.edit_row)
         run_row = QHBoxLayout()
+        run_row.setSpacing(8)
+        self.status = QLabel("选择观察点后可计算该处的业务输出")
+        self.status.setWordWrap(True)
+        self.status.setStyleSheet("color:#8eafc3")
+        run_row.addWidget(self.status, 1)
         self.preview_button = self._button(run_row, "计算所选输出", self.run_selected)
         self.preview_button.setToolTip("计算到发射信号、功放或接收信号观察点；后续模块无需配置。")
         self.run_button = self._button(run_row, "运行完整链路", self.run_chain)
-        self._button(run_row, "1:1", lambda: self.graph.viewer().reset_zoom())
-        self.cancel_button = self._button(run_row, "取消", self.cancel_run)
-        self.cancel_button.setEnabled(False)
-        self.status = QLabel("选择发射信号、功放或接收信号，点击“计算所选输出”查看业务数据")
-        self.status.setWordWrap(True)
-        run_row.addWidget(self.status, 1)
+        self.run_button.setProperty("class", "primary")
         root.addLayout(run_row)
         self.graph = NodeGraph()
         self.graph.register_nodes(list(NODE_CLASSES.values()))
@@ -705,24 +704,6 @@ class WaveformWorkspace(QDialog):
                 if mate is not None and mate.get_property("device_model") is None:
                     mate.set_property("device_model", copy.deepcopy(node.get_property("device_model")), push_undo=False)
 
-    def add_selected_kind(self):
-        if len(self.graph.all_nodes()) >= 64:
-            QMessageBox.warning(self, "模块数量", "最多添加 64 个模块")
-            return
-        self.create_stage(self.palette.currentData(), [100, 100])
-        self.invalidate()
-
-    def delete_selected(self):
-        self.graph.delete_nodes(self.graph.selected_nodes())
-        self.invalidate()
-
-    def configure_selected(self):
-        selected = self.graph.selected_nodes()
-        if selected:
-            self.configure_node(selected[0])
-        else:
-            self.status.setText("请先单击选择一个模块，也可直接双击模块进行配置")
-
     def configure_node(self, node):
         if self.worker:
             return
@@ -798,7 +779,7 @@ class WaveformWorkspace(QDialog):
     def run_selected(self):
         key = self.point.currentData()
         if key is None:
-            self.status.setText("请先添加并选择一个输出模块")
+            self.status.setText("请先选择一个观察点")
             return
         self.start_run(key.removesuffix("::error").removesuffix("::B"))
 
@@ -826,16 +807,9 @@ class WaveformWorkspace(QDialog):
         self.run_button.setEnabled(not busy)
         self.preview_button.setEnabled(not busy)
         self.point.setEnabled(not busy)
-        self.cancel_button.setEnabled(busy)
 
     def run_progress(self, index, total, name):
         self.status.setText(f"正在计算 {index}/{total} · {name.replace(chr(10), ' ')}")
-
-    def cancel_run(self):
-        if self.worker:
-            self.worker.cancel.set()
-            self.status.setText("正在取消，将在当前模块结束后停止…")
-            self.cancel_button.setEnabled(False)
 
     def run_finished(self, outputs, error):
         cancelled = self.worker.cancel.is_set()

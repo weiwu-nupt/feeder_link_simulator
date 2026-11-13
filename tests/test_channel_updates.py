@@ -98,6 +98,7 @@ class ChannelUpdateTests(unittest.TestCase):
     def test_editor_import_actions_and_noise_library_binding(self):
         from link_sim.algorithm.filter_model import FilterModelDialog
         from link_sim.algorithm.mixer_model import MixerModelDialog
+        from link_sim.algorithm.model_store import ModelStore
         from link_sim.algorithm.noise_model import NoiseModelDialog
         from link_sim.ui.device_model_bindings import capture_device, apply_device
         from link_sim.ui.waveform_workspace import StageDialog
@@ -110,10 +111,37 @@ class ChannelUpdateTests(unittest.TestCase):
             for cls, path in ((FilterModelDialog, impulse), (MixerModelDialog, pn)):
                 editor = cls()
                 try:
+                    parameter_model = capture_device(editor)
+                    self.assertEqual([editor.tabs.tabText(i) for i in range(editor.tabs.count())],
+                                     ["参数建模", "实测数据建模与导出"])
+                    self.assertIs(editor.tabs.currentWidget(), editor.parameter_page)
+                    editor.tabs.setCurrentWidget(editor.measured_page)
+                    page = editor.measured_page
+                    self.assertFalse(page.export_button.isEnabled())
                     with patch("PySide6.QtWidgets.QFileDialog.getOpenFileName", return_value=(str(path), "")), \
                          patch("PySide6.QtWidgets.QMessageBox.warning", side_effect=AssertionError):
-                        editor.btn_measured.click()
-                    self.assertEqual(capture_device(editor).name, path.stem)
+                        page.browse_button.click()
+                        self.assertIsNone(page.model)
+                        page.build_button.click()
+                    self.assertEqual(page.model.name, path.stem)
+                    self.assertTrue(page.canvas.figure.axes)
+                    target = root/(path.stem+".npz")
+                    with patch("PySide6.QtWidgets.QFileDialog.getSaveFileName", return_value=(str(target), "")), \
+                         patch("PySide6.QtWidgets.QMessageBox.warning", side_effect=AssertionError):
+                        page.export_button.click()
+                    self.assertEqual(read_model_file(target).parameters, page.model.parameters)
+                    store = ModelStore(root/"measured.sqlite3")
+                    with patch("link_sim.ui.model_library.current_store", return_value=store), \
+                         patch("link_sim.ui.model_library.SaveModelDialog.exec", return_value=QDialog.DialogCode.Accepted), \
+                         patch("PySide6.QtWidgets.QMessageBox.warning", side_effect=AssertionError):
+                        page.save_button.click()
+                    [entry] = store.list(page.model.kind)
+                    self.assertEqual(store.get(entry["id"]).parameters, page.model.parameters)
+                    editor.tabs.setCurrentWidget(editor.parameter_page)
+                    self.assertEqual(capture_device(editor).parameters, parameter_model.parameters)
+                    page.fs.setText("50")
+                    self.assertFalse(page.export_button.isEnabled())
+                    self.assertFalse(page.save_button.isEnabled())
                 finally:
                     editor.close()
                     editor.deleteLater()

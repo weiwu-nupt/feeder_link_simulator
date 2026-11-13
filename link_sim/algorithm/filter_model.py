@@ -37,11 +37,12 @@ from PySide6.QtWidgets import (
     QWidget, QVBoxLayout, QHBoxLayout, QFormLayout,
     QLabel, QLineEdit, QPushButton, QComboBox, QCheckBox,
     QGroupBox, QSplitter, QFileDialog, QMessageBox, QSizePolicy,
-    QGridLayout, QScrollArea,
+    QGridLayout, QScrollArea, QTabWidget,
 )
 from PySide6.QtCore import Qt
 
 from link_sim.ui.base_dialog import ModuleDialog
+from link_sim.ui.measured_model_page import MeasuredModelPage
 
 
 # ── 字体 ──────────────────────────────────────────────────
@@ -351,9 +352,22 @@ class FilterModelDialog(ModuleDialog):
         self._last = None
         self._library_filter = None
         super().__init__(*a, **kw)
+        self.content_layout.removeWidget(self.model_actions)
+        self.parameter_page.layout().insertWidget(0, self.model_actions)
 
     # ──────────────────────────────────────────────────────
     def build_content(self, layout: QVBoxLayout):
+        self.tabs = QTabWidget()
+        self.parameter_page = QWidget()
+        parameter_layout = QVBoxLayout(self.parameter_page)
+        parameter_layout.setContentsMargins(0, 0, 0, 0)
+        self._build_parameter_model(parameter_layout)
+        self.measured_page = MeasuredModelPage("filter")
+        self.tabs.addTab(self.parameter_page, "参数建模")
+        self.tabs.addTab(self.measured_page, "实测数据建模与导出")
+        layout.addWidget(self.tabs)
+
+    def _build_parameter_model(self, layout: QVBoxLayout):
         layout.setContentsMargins(10, 8, 10, 10)
         layout.setSpacing(0)
 
@@ -454,11 +468,6 @@ class FilterModelDialog(ModuleDialog):
         vf.addRow(self._lbl("显示:"), self.cb_view)
         vg.layout().addLayout(vf)
         lv.addWidget(vg)
-
-        self.btn_measured = QPushButton("从实测数据导入…")
-        self.btn_measured.setToolTip("CSV/TXT：单列冲激响应 h，或三列 频率(Hz)、增益(dB)、相位(deg)。\n频响导入生成 4096 点实数 FIR，测量范围外响应为零。\nMAT/NPZ：h 或 b/a/sos，可附 fs(Hz)；否则使用当前采样率。")
-        self.btn_measured.clicked.connect(self._import_measured)
-        lv.addWidget(self.btn_measured)
 
         self.btn_run = QPushButton("设计并绘制")
         self.btn_run.setFixedHeight(34)
@@ -934,20 +943,6 @@ class FilterModelDialog(ModuleDialog):
         return tag
 
     # ── 保存 ──────────────────────────────────────────────
-    def _import_measured(self):
-        path, _ = QFileDialog.getOpenFileName(self, "导入实测数据", "", "实测数据 (*.csv *.txt *.mat *.npz)")
-        if not path:
-            return
-        try:
-            from .measured_data import load_measured_filter
-            from link_sim.ui.device_model_bindings import apply_device
-            model = load_measured_filter(path, float(self.e_fs.text())*1e6)
-            apply_device(self, model)
-            self._library_identity = (model.kind, model.name, model.description)
-            self.status.setText("已导入实测数据：" + path)
-        except Exception as exc:
-            QMessageBox.warning(self, "实测数据导入失败", str(exc))
-
     def _save(self):
         path, _ = QFileDialog.getSaveFileName(
             self, "保存图像", "filter_model.png",

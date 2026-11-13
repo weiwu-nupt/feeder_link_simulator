@@ -11,10 +11,11 @@ from matplotlib.figure import Figure
 from PySide6.QtCore import Qt
 from PySide6.QtWidgets import (
     QFileDialog, QFormLayout, QGroupBox, QLabel, QLineEdit,
-    QMessageBox, QPushButton, QSizePolicy, QSplitter, QVBoxLayout, QWidget,
+    QMessageBox, QPushButton, QSizePolicy, QSplitter, QTabWidget, QVBoxLayout, QWidget,
 )
 
 from link_sim.ui.base_dialog import ModuleDialog
+from link_sim.ui.measured_model_page import MeasuredModelPage
 from .mixer_noise_core import generate_phase_noise, phase_noise_psd as phase_noise_psd
 
 
@@ -189,8 +190,21 @@ class MixerModelDialog(ModuleDialog):
     def __init__(self, *args, **kwargs):
         self._last_result = None
         super().__init__(*args, **kwargs)
+        self.content_layout.removeWidget(self.model_actions)
+        self.parameter_page.layout().insertWidget(0, self.model_actions)
 
     def build_content(self, layout: QVBoxLayout):
+        self.tabs = QTabWidget()
+        self.parameter_page = QWidget()
+        parameter_layout = QVBoxLayout(self.parameter_page)
+        parameter_layout.setContentsMargins(0, 0, 0, 0)
+        self._build_parameter_model(parameter_layout)
+        self.measured_page = MeasuredModelPage("mixer")
+        self.tabs.addTab(self.parameter_page, "参数建模")
+        self.tabs.addTab(self.measured_page, "实测数据建模与导出")
+        layout.addWidget(self.tabs)
+
+    def _build_parameter_model(self, layout: QVBoxLayout):
         layout.setContentsMargins(10, 8, 10, 10)
         splitter = QSplitter(Qt.Orientation.Horizontal)
         splitter.setHandleWidth(1)
@@ -234,11 +248,6 @@ class MixerModelDialog(ModuleDialog):
         pn_hint.setStyleSheet("font-size:8pt;color:#648A9C;")
         pn_group.layout().addWidget(pn_hint)
         left_layout.addWidget(pn_group)
-
-        self.btn_measured = QPushButton("从实测数据导入…")
-        self.btn_measured.setToolTip("CSV/TXT：两列 频偏(Hz)、相噪(dBc/Hz)，允许一行表头。\nMAT：offsets 与 levels 数组。导入后可保存到模型库。")
-        self.btn_measured.clicked.connect(self._import_measured)
-        left_layout.addWidget(self.btn_measured)
 
         self.btn_run = QPushButton("计算 / 绘图")
         self.btn_run.setFixedHeight(34)
@@ -339,20 +348,6 @@ class MixerModelDialog(ModuleDialog):
             f"L(f) → 随机相位噪声 φ[n] → 输出频谱裙边  |  "
             f"不含热噪声、非线性、变频损耗、LO 泄漏和杂散"
         )
-
-    def _import_measured(self):
-        path, _ = QFileDialog.getOpenFileName(self, "导入实测数据", "", "实测数据 (*.csv *.txt *.mat)")
-        if not path:
-            return
-        try:
-            from .measured_data import load_measured_mixer
-            from link_sim.ui.device_model_bindings import apply_device
-            model = load_measured_mixer(path, self._collect_cfg())
-            apply_device(self, model)
-            self._library_identity = (model.kind, model.name, model.description)
-            self.status.setText("已导入实测数据：" + path)
-        except Exception as exc:
-            QMessageBox.warning(self, "实测数据导入失败", str(exc))
 
     def _save(self):
         path, _ = QFileDialog.getSaveFileName(
