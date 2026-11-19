@@ -66,51 +66,19 @@ class StartupWindow(QWidget):
             self.main_window = window_type(load_map=False)
             self.main_window.web.loadProgress.connect(self.map_progress)
             self.main_window.web.loadFinished.connect(self.finish)
-            from link_sim.ui.workspace import LazyDialogPage
-            # The waveform canvas loads on first use; preloading NodeGraphQt
-            # makes Qt.py probe optional Qt DLLs during every startup.
-            self._preload_pages = [page for page in self.main_window.findChildren(LazyDialogPage)
-                                   if page.class_name != "WaveformWorkspace"]
-            self._preload_index = 0
-            QTimer.singleShot(0, self.preload_next_page)
+            # Link-simulation pages already load on first display.  Waiting
+            # for every optional editor here can hold the splash for minutes.
+            self.update_progress(80, "正在加载 Cesium 地图…")
+            self.map_timeout.start()
+            QTimer.singleShot(0, self._load_map)
         except Exception as exc:
             self.fail(exc)
 
-    def preload_next_page(self):
-        """Build every link-simulation page before exposing the main window."""
-        if self._preload_index == len(self._preload_pages):
-            self.update_progress(80, "正在加载 Cesium 地图…")
-            self.map_timeout.start()
-            try:
-                self.main_window.load_map()
-            except Exception as exc:
-                self.fail(exc)
-            return
-        page = self._preload_pages[self._preload_index]
-        labels = {
-            "PAModelDialog": "功放", "FilterModelDialog": "滤波器",
-            "MixerModelDialog": "混频器", "ADDAModelDialog": "ADC/DAC",
-            "NoiseModelDialog": "底噪模型", "ModelLibraryDialog": "模型库",
-            "WaveformWorkspace": "全链路仿真",
-        }
-        label = labels.get(page.class_name, page.class_name)
-        total = len(self._preload_pages)
-        self.update_progress(45 + 35*self._preload_index//total,
-                             f"正在初始化链路仿真 · {label}（{self._preload_index+1}/{total}）…")
-        if page.loaded:
-            self._preload_index += 1
-            QTimer.singleShot(0, self.preload_next_page)
-        else:
-            page.load_finished.connect(self.preload_page_finished)
-            page.ensure_loaded(background=True)
-
-    def preload_page_finished(self, ok, message):
-        page = self._preload_pages[self._preload_index]
-        page.load_finished.disconnect(self.preload_page_finished)
-        if not ok:
-            self._module_warnings.append(f"{page.class_name}: {message}")
-        self._preload_index += 1
-        QTimer.singleShot(0, self.preload_next_page)
+    def _load_map(self):
+        try:
+            self.main_window.load_map()
+        except Exception as exc:
+            self.fail(exc)
 
     def map_progress(self, value):
         self.update_progress(80 + 19*value//100, f"正在加载 Cesium 地图… {value}%")

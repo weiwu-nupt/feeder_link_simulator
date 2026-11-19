@@ -70,7 +70,7 @@ class SimulationConfig:
     gateway_redundancy: int = 1
     gateway_max_antennas: int = 20
     gateway_planning_mode: str = "specified"
-    planning_horizon_s: float = 1800.0
+    planning_horizon_s: float = 600.0
     planning_slot_s: float = 300.0
     fast_evaluation_period_s: float = 1.0
     fast_adjust_period_s: float = 1.0
@@ -92,4 +92,6 @@ class SimulationConfig:
     feeder_rolloff: float = 0.20
     satellite_eirp_dbw: float = 26.0
     planning_selection_strategy: str = "legacy"
+    weather_forecast: dict = field(default_factory=dict)
+    simulation_start_utc: str = "2000-01-01T00:00:00+00:00"
 
