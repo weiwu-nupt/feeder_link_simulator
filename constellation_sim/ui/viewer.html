@@ -41,6 +41,7 @@
 <div class="legend-row"><i class="sw" style="background:#ffd34d"></i>不足 1 Gb/s</div>
 <div class="legend-row"><i class="sw" style="background:#ff5b68"></i>已满</div>
 <div class="legend-row"><i class="sw" style="background:#9aa9b4"></i>不可用</div>
+<div class="legend-row">双馈：直线叠加，粗实线 P1、细虚线 P2</div>
 <label class="legend-row"><input type="checkbox" data-layer="planRoutes"><i class="sw" style="background:#4ebaff"></i>规划ISL路径</label>
 <label class="legend-row"><input type="checkbox" data-layer="scheduleRoutes" checked><i class="sw" style="background:#b98cff"></i>实际ISL路径</label>
 </div></div><div id="situation" class="situation" style="display:none"></div><div id="trafficSummary" class="traffic-summary" style="display:none"></div><div id="planningSummary" class="traffic-summary collapsed" style="display:none"></div><div id="objectInfo" class="object-info"></div>
@@ -332,12 +333,17 @@ function renderPlanning(pos){
   const stationPosition=gs=>Cesium.Cartesian3.fromDegrees(gs.lon,gs.lat,gs.alt||0),byGateway=new Map();
   // 地图推演只呈现站星规划骨架。逐跳路由保留在结果表中，避免与调度连接混在一起。
   const linkState=new Map((run.link_states||[]).map(row=>[`${row.gateway}:${row.satellite}`,row]));
-  const activeLink=new Map((run.active_links||[]).map(row=>[`${row.gateway}:${row.satellite}`,row]));
+  const activeLink=new Map();
+  for(const row of (run.active_links||[])){
+    const key=`${row.gateway}:${row.satellite}`,group=activeLink.get(key)||[];
+    group.push(row);activeLink.set(key,group);
+  }
   const marginColor=link=>{
-    const key=`${link.gateway}:${link.satellite}`,state=linkState.get(key),active=activeLink.get(key);
-    if(!active||Number(active.rate_gbps||0)<=0)return {name:'unavailable',color:'#9aa9b4',spare:0};
-    const capacity=Math.max(0,Number(active.rate_gbps||state.rate_gbps||0));
-    const used=Math.max(0,Number(active.scheduled_gbps||0));
+    const key=`${link.gateway}:${link.satellite}`,port=Number(link.feeder_port||1);
+    const active=(activeLink.get(key)||[]).filter(row=>Number(row.feeder_port||1)===port);
+    const capacity=active.reduce((sum,row)=>sum+Math.max(0,Number(row.rate_gbps||0)),0);
+    if(capacity<=0)return {name:'unavailable',color:'#9aa9b4',spare:0};
+    const used=active.reduce((sum,row)=>sum+Math.max(0,Number(row.scheduled_gbps||0)),0);
     const spare=Math.max(0,capacity-used);
     if(spare<=1e-6)return {name:'full',color:'#ff5b68',spare:0};
     if(spare<1)return {name:'low',color:'#ffd34d',spare};
@@ -345,6 +351,22 @@ function renderPlanning(pos){
   };
   const health={free:0,low:0,full:0,unavailable:0};
   for(const link of plan.links)health[marginColor(link).name]++;
+  const plannedBySatellite=new Map();
+  for(const link of plan.links){const sid=Number(link.satellite),group=plannedBySatellite.get(sid)||[];group.push(link);plannedBySatellite.set(sid,group)}
+  for(const [sid,group] of plannedBySatellite){
+    if(group.length<2)continue;
+    const sat=pos.get(sid);if(!sat)continue;
+    const portDetails=[...group].sort((a,b)=>Number(a.feeder_port||1)-Number(b.feeder_port||1)).map(link=>{
+      const gid=Number(link.gateway),port=Number(link.feeder_port||1);
+      const connected=(run.active_links||[]).some(row=>Number(row.satellite)===sid&&Number(row.gateway)===gid&&Number(row.feeder_port||1)===port);
+      return `P${port}→${cfg.stations[gid]?.name||gatewayCode(gid)}[${connected?'已接':'未接'}]`;
+    });
+    feederLabels.add({position:sat,text:`双馈 ${portDetails.join('  ')}`,
+      font:'bold 12px Microsoft YaHei',fillColor:Cesium.Color.fromCssColorString('#ffd76a'),
+      outlineColor:Cesium.Color.BLACK,outlineWidth:3,style:Cesium.LabelStyle.FILL_AND_OUTLINE,
+      horizontalOrigin:Cesium.HorizontalOrigin.LEFT,verticalOrigin:Cesium.VerticalOrigin.BOTTOM,
+      pixelOffset:new Cesium.Cartesian2(20,-20),disableDepthTestDistance:Number.POSITIVE_INFINITY});
+  }
   const totals=cfg.stations.map(()=>({available:0,used:0}));
   for(const link of (run.active_links||[])){
     const station=totals[Number(link.gateway)];if(!station)continue;
@@ -352,6 +374,29 @@ function renderPlanning(pos){
     station.used+=Math.max(0,Number(link.scheduled_gbps||0));
   }
   const drawnGroundLinks=new Set();
+  const drawFeederLink=(link,plannedLink)=>{
+    const gs=cfg.stations[link.gateway],sat=pos.get(link.satellite);if(!gs||!sat)return;
+    const port=Number(link.feeder_port||1),key=`${link.gateway}:${link.satellite}:P${port}`;
+    if(drawnGroundLinks.has(key))return;
+    const group=plannedBySatellite.get(Number(link.satellite))||[];
+    const sameStation=group.filter(item=>Number(item.gateway)===Number(link.gateway)).length>=2;
+    const positions=[stationPosition(gs),sat];
+    const margin=marginColor(link),color=Cesium.Color.fromCssColorString(margin.color);
+    const dashed=port===2&&group.length>=2;
+    const material=margin.name==='unavailable'||dashed
+      ?Cesium.Material.fromType('PolylineDash',{color:(sameStation&&dashed&&margin.name!=='unavailable'?Cesium.Color.fromCssColorString('#d7f7ff'):color).withAlpha(.95),dashLength:dashed?10:14})
+      :Cesium.Material.fromType('PolylineGlow',{color:color.withAlpha(.95),glowPower:.12});
+    putLine(`plan-link:${key}`,{positions,width:sameStation?(dashed?2.5:8):(margin.name==='full'?3.2:2.7),material});
+    drawnGroundLinks.add(key);
+    if(group.length>=2&&!sameStation){
+      const labelPosition=Cesium.Cartesian3.midpoint(positions[0],sat,new Cesium.Cartesian3());
+      feederLabels.add({position:labelPosition,text:`P${port} · ${gs.name}${plannedLink?'':'（当前有效）'}`,
+        font:'bold 12px Microsoft YaHei',fillColor:Cesium.Color.fromCssColorString('#ffffff'),
+        outlineColor:Cesium.Color.BLACK,outlineWidth:3,style:Cesium.LabelStyle.FILL_AND_OUTLINE,
+        horizontalOrigin:Cesium.HorizontalOrigin.CENTER,verticalOrigin:Cesium.VerticalOrigin.BOTTOM,
+        pixelOffset:new Cesium.Cartesian2(0,-5),disableDepthTestDistance:Number.POSITIVE_INFINITY});
+    }
+  };
   const prepoints=(plan.standby_prepoints||[]).filter(row=>Number(current.meta.time_s)>=Number(row.prepoint_start_s)&&Number(current.meta.time_s)<Number(row.prepoint_ready_s));
   for(const row of prepoints){
     const gs=cfg.stations[Number(row.gateway)],sat=pos.get(Number(row.satellite));if(!gs||!sat)continue;
@@ -361,24 +406,18 @@ function renderPlanning(pos){
     putPoint(`prepoint:${row.gateway}:${row.antenna_id}`,{position:sat,pixelSize:34,color:Cesium.Color.TRANSPARENT,
       outlineColor:color,outlineWidth:3,disableDepthTestDistance:Number.POSITIVE_INFINITY});
   }
-  for(const link of plan.links){
+  for(const link of [...plan.links].sort((a,b)=>Number(a.feeder_port||1)-Number(b.feeder_port||1))){
     const gs=cfg.stations[link.gateway],sat=pos.get(link.satellite);if(!gs||!sat)continue;
     const linkStatus=linkState.get(`${link.gateway}:${link.satellite}`)?.status;
     if(linkStatus==='等待切换'||linkStatus==='切星捕获中')continue;
-    const margin=marginColor(link),color=Cesium.Color.fromCssColorString(margin.color);
-    const material=margin.name==='unavailable'?Cesium.Material.fromType('PolylineDash',{color:color.withAlpha(.85),dashLength:14}):Cesium.Material.fromType('PolylineGlow',{color:color.withAlpha(.95),glowPower:.12});
-    putLine(`plan-link:${link.gateway}:${link.satellite}`,{positions:[stationPosition(gs),sat],width:margin.name==='full'?3.2:2.7,material});
-    drawnGroundLinks.add(`${link.gateway}:${link.satellite}`);
+    drawFeederLink(link,true);
   }
   // During a scheduled handover the old feeder remains active even though it
   // is absent from the new slot's target links. Draw the same links as the rings.
-  for(const link of (run.active_links||[])){
-    const key=`${link.gateway}:${link.satellite}`;
+  for(const link of [...(run.active_links||[])].sort((a,b)=>Number(a.feeder_port||1)-Number(b.feeder_port||1))){
+    const key=`${link.gateway}:${link.satellite}:P${Number(link.feeder_port||1)}`;
     if(drawnGroundLinks.has(key))continue;
-    const gs=cfg.stations[link.gateway],sat=pos.get(link.satellite);if(!gs||!sat)continue;
-    const margin=marginColor(link),color=Cesium.Color.fromCssColorString(margin.color);
-    putLine(`plan-link:${key}`,{positions:[stationPosition(gs),sat],width:margin.name==='full'?3.2:2.7,
-      material:Cesium.Material.fromType('PolylineGlow',{color:color.withAlpha(.95),glowPower:.12})});
+    drawFeederLink(link,false);
   }
   // Keep the actual feeder-link attenuation beside its feeder satellite.
   for(const link of (run.active_links||[])){

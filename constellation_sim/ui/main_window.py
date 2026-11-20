@@ -5,6 +5,7 @@ from __future__ import annotations
 
 import json
 import csv
+import io
 import math
 import heapq
 import sys
@@ -561,7 +562,7 @@ class PlanningResultsWidget(QWidget):
         for table in (self.plans,self.plan_links,self.plan_routes):
             self._style_table(table)
         link_header=self.plan_links.horizontalHeader();link_header.setStretchLastSection(False)
-        link_header.setSectionResizeMode(0,QHeaderView.ResizeMode.Fixed);self.plan_links.setColumnWidth(0,165)
+        link_header.setSectionResizeMode(0,QHeaderView.ResizeMode.Fixed);self.plan_links.setColumnWidth(0,245)
         for column in range(1,8):link_header.setSectionResizeMode(column,QHeaderView.ResizeMode.Stretch)
         link_header.setSectionResizeMode(8,QHeaderView.ResizeMode.Fixed);self.plan_links.setColumnWidth(8,96)
         link_header.setSectionResizeMode(9,QHeaderView.ResizeMode.Fixed);self.plan_links.setColumnWidth(9,100)
@@ -571,6 +572,11 @@ class PlanningResultsWidget(QWidget):
         self.plan_links.cellClicked.connect(self._show_tle_cell)
         self.slow_title=QLabel("慢周期站星规划");self.slow_title.setStyleSheet("font-size:14px;font-weight:700;color:#63e8ff")
         self.plans_label=QLabel("规划批次");self.links_label=QLabel("规划馈电链路");self.routes_label=QLabel("逐跳路径用于内部可达性校核；请在地图点击卫星按需查看")
+        self.dual_links_label=QLabel("双链路：尚无规划数据")
+        self.dual_links_label.setWordWrap(True)
+        self.dual_links_label.setStyleSheet("color:#f4d37a;font-weight:600")
+        self.dual_links_only=QCheckBox("仅看双链路")
+        self.dual_links_only.toggled.connect(lambda _checked:self._show_offline_plan_index(self.selected_offline_index) if self.selected_offline_index is not None else None)
         layout.addWidget(_gateway_scope_row(self.gateway_scope));layout.addWidget(_rain_scope_row(self.rain_scope))
         self.result_tabs=QTabWidget();self.result_tabs.setDocumentMode(True);self.result_tabs.setObjectName("planningResultTabs")
         batch_page=QWidget();batch_layout=QVBoxLayout(batch_page);batch_layout.setContentsMargins(8,8,8,8);batch_layout.setSpacing(7)
@@ -583,7 +589,7 @@ class PlanningResultsWidget(QWidget):
         for minute in range(5):self.slot_scope.addItem(f"时隙 +{minute:02d}:00",minute)
         self.slot_scope.currentChanged.connect(lambda _index:self._show_offline_plan_index(self.selected_offline_index) if self.selected_offline_index is not None else None)
         self.slot_scope.hide();link_layout.addWidget(self.slot_scope)
-        link_layout.addWidget(self.links_label);link_layout.addWidget(_table_export_bar(self,self.plan_links,"规划馈电链路"));link_layout.addWidget(self.plan_links,1);link_layout.addWidget(self.routes_label)
+        link_layout.addWidget(self.links_label);link_layout.addWidget(self.dual_links_label);link_layout.addWidget(self.dual_links_only);link_layout.addWidget(_table_export_bar(self,self.plan_links,"规划馈电链路"));link_layout.addWidget(self.plan_links,1);link_layout.addWidget(self.routes_label)
         self.result_tabs.addTab(batch_page,"规划批次")
         priority_page=QWidget();priority_layout=QVBoxLayout(priority_page);priority_layout.setContentsMargins(8,8,8,8)
         self.priority_plan_label=QLabel("重点区域规划业务（Gb/s）")
@@ -920,14 +926,34 @@ class PlanningResultsWidget(QWidget):
         if time_index>=0:
             self.time_scope.blockSignals(True);self.time_scope.setCurrentIndex(time_index);self.time_scope.blockSignals(False)
         gateway_filter=self.gateway_scope.currentData()
-        links=[link for link in plan.get("links",[]) if gateway_filter is None or int(link.get("gateway",-1))==gateway_filter]
-        links.sort(key=lambda link:(int(link.get("gateway",-1)),int(link.get("satellite",-1))))
+        all_links=list(plan.get("links",[]))
+        by_satellite={}
+        for link in all_links:by_satellite.setdefault(int(link.get("satellite",-1)),[]).append(link)
+        pairs={sat:group for sat,group in by_satellite.items() if len(group)>=2}
+        same_station=sum(len({int(link.get("gateway",-1)) for link in group})==1 for group in pairs.values())
+        cross_station=len(pairs)-same_station
+        self.dual_links_label.setText(f"双链路卫星 {len(pairs)} 颗（同站 {same_station}、跨站 {cross_station}）；黄色编号标识双链路，P1/P2 为两条独立馈电链路。" if pairs else "本时隙无双链路分配；P1 表示单条馈电链路。")
+        links=[link for link in all_links if (gateway_filter is None or int(link.get("gateway",-1))==gateway_filter) and (not self.dual_links_only.isChecked() or int(link.get("satellite",-1)) in pairs)]
+        links.sort(key=lambda link:(int(link.get("satellite",-1)),int(link.get("gateway",-1)),int(link.get("feeder_port",1))) if self.dual_links_only.isChecked() else (int(link.get("gateway",-1)),int(link.get("satellite",-1)),int(link.get("feeder_port",1))))
         for row,link in enumerate(links):
             gateway=int(link.get("gateway",0));name=self.station_names[gateway] if gateway<len(self.station_names) else f"GW-{gateway+1:02d}"
-            self._fill(self.plan_links,row,[f"GW-{gateway+1:02d}/SAT-{int(link.get('satellite',0))+1:05d}",name,f"SAT-{int(link.get('satellite',0))+1:05d}",f"{float(link.get('elevation_deg',0)):.2f}°",
+            self._fill(self.plan_links,row,[f"GW-{gateway+1:02d}/SAT-{int(link.get('satellite',0))+1:05d}/P{int(link.get('feeder_port',1))}",name,f"SAT-{int(link.get('satellite',0))+1:05d}",f"{float(link.get('elevation_deg',0)):.2f}°",
                 f"{float(link.get('rain_attenuation_db',0)):.2f}",f"{float(link.get('snr_db',0)):.2f}",link.get("modcod","--"),
                 f"{float(link.get('rate_gbps',0)):.3f}",_rain_severity_text(link.get("rain_severity",plan.get("rain_grade","--"))),"查看 TLE" if link.get("tle") else "—"])
             self.plan_links.item(row,9).setData(Qt.ItemDataRole.UserRole,link.get("tle"))
+            group=pairs.get(int(link.get("satellite",-1)))
+            if group:
+                gateways={int(item.get("gateway",-1)) for item in group}
+                kind="同站双链路" if len(gateways)==1 else "跨站双链路"
+                peer="、".join(f"{self.station_names[int(item['gateway'])] if int(item['gateway'])<len(self.station_names) else 'GW-'+str(int(item['gateway'])+1)}/P{int(item.get('feeder_port',1))}" for item in sorted(group,key=lambda item:int(item.get('feeder_port',1))))
+                for column in range(self.plan_links.columnCount()):
+                    cell=self.plan_links.item(row,column)
+                    if cell:
+                        cell.setBackground(QBrush(QColor("#59471d")))
+                        cell.setToolTip(f"{kind}：{peer}")
+                identifier=self.plan_links.item(row,0)
+                font=identifier.font();font.setBold(True);identifier.setFont(font)
+                identifier.setForeground(QBrush(QColor("#ffd76a")))
         scope="全网" if gateway_filter is None else _gateway_name(self.station_names,gateway_filter)
         self.links_label.setText(f"规划馈电链路 · {int(float(plan.get('valid_from_s',0))//60):02d}:00 · {_rain_severity_text(plan.get('rain_grade','--'))} · {scope} · {len(links)} 条")
         if plan.get("rain_field") in ("synthetic_field","forecast"):
@@ -941,6 +967,7 @@ class PlanningResultsWidget(QWidget):
         pass  # Deployment data remains available to the backend; its page was removed.
     def clear(self):
         for table in (self.plans,self.plan_links,self.plan_routes):table.setRowCount(0)
+        self.dual_links_label.setText("双链路：尚无规划数据")
         self.pointing_antenna.clear();self.pointing_detail.setRowCount(0);self.pointing_chart.set_samples([]);self.switch_chart.set_samples([])
         self.priority_plan_chart.clear();self.result_tabs.setTabVisible(self.priority_plan_tab_index,False)
         self.pointing_summary.setText("生成逐时隙规划后显示天线指向连续性")
@@ -1557,12 +1584,13 @@ class SimulationWorker(QObject):
         self._display_options={"planes":config.planes,"count":config.display_plane_count,"center":config.center_plane,"page":0,"bounds":None,"station_count":len(config.stations)}
         self._planning_strategy_request=(.10,.90)
         self._planning_selection_request=None
+        self._feeder_link_mode_request=None
         self._planning_reserve_request=None
         self._planning_slew_request=None
         self._antenna_switch_request=None
         self._scheduling_request=None
         self._offline_plan_requested=False;self._offline_catalog=[];self._offline_grade="轻雨";self._installed_offline_key=None
-        self.audit_directory="";self._pointing_audit_previous={}
+        self.audit_directory="";self._pointing_audit_previous={};self._pointing_audit_chunks=[]
 
     def _audit_path(self,name):
         if not self.audit_directory:
@@ -1695,10 +1723,20 @@ class SimulationWorker(QObject):
                 "azimuth_deg":pointing["azimuth_deg"],"elevation_deg":pointing["pointing_elevation_deg"],
                 "los_unit":pointing["los_unit"]}
         if rows:
-            with path.open("a",encoding="utf-8",newline="") as stream:
-                writer=csv.DictWriter(stream,fieldnames=fields)
-                if stream.tell()==0:writer.writeheader()
-                writer.writerows(rows)
+            # Buffer per-frame audit rows. Synchronous disk writes can stall a
+            # one-second simulation frame; flush once after the run finishes.
+            stream=io.StringIO(newline="")
+            writer=csv.DictWriter(stream,fieldnames=fields)
+            if not self._pointing_audit_chunks:writer.writeheader()
+            writer.writerows(rows)
+            self._pointing_audit_chunks.append(stream.getvalue())
+
+    def _flush_frame_pointing_audit(self):
+        if not self._pointing_audit_chunks:return
+        path=self._audit_path("actual_antenna_pointing.csv")
+        with path.open("w",encoding="utf-8",newline="") as stream:
+            stream.writelines(self._pointing_audit_chunks)
+        self._pointing_audit_chunks.clear()
 
     def set_display_options(self,options):
         with self._control_lock:self._display_options=dict(options)
@@ -1714,12 +1752,13 @@ class SimulationWorker(QObject):
         with self._control_lock:return self._latest_full_frame
 
     @Slot()
-    def request_offline_planning(self,capacity_weight=None,delay_weight=None,capacity_reserve_ratio=None,selection_strategy=None,max_pointing_change_deg=None,antenna_switch=None):
+    def request_offline_planning(self,capacity_weight=None,delay_weight=None,capacity_reserve_ratio=None,selection_strategy=None,max_pointing_change_deg=None,antenna_switch=None,feeder_link_mode=None):
         with self._control_lock:
             self._offline_plan_requested=True
             if capacity_weight is not None and delay_weight is not None:self._planning_strategy_request=(float(capacity_weight),float(delay_weight))
             if capacity_reserve_ratio is not None:self._planning_reserve_request=max(0.,float(capacity_reserve_ratio))
             if selection_strategy is not None:self._planning_selection_request=str(selection_strategy)
+            if feeder_link_mode is not None:self._feeder_link_mode_request=str(feeder_link_mode)
             if max_pointing_change_deg is not None:self._planning_slew_request=max(0.,float(max_pointing_change_deg))
             if antenna_switch is not None:self._antenna_switch_request=tuple(antenna_switch)
 
@@ -1944,6 +1983,7 @@ class SimulationWorker(QObject):
                 capacity_weight=cfg.planning_capacity_weight,
                 delay_weight=cfg.planning_delay_weight,
                 selection_strategy=cfg.planning_selection_strategy,
+                feeder_link_mode=cfg.feeder_link_mode,
                 rain_field="forecast" if cfg.rain_source in ("imerg_csv","weather_forecast") else "synthetic_field",
                 capacity_reserve_ratio=cfg.planning_capacity_reserve_percent / 100.0,
                 priority_task_regions=tuple(cfg.priority_task_regions),
@@ -2253,6 +2293,8 @@ class SimulationWorker(QObject):
                     self._planning_strategy_request=None
                     selection_request=self._planning_selection_request
                     self._planning_selection_request=None
+                    feeder_link_mode_request=self._feeder_link_mode_request
+                    self._feeder_link_mode_request=None
                     reserve_request=self._planning_reserve_request
                     self._planning_reserve_request=None
                     slew_request=self._planning_slew_request
@@ -2276,6 +2318,10 @@ class SimulationWorker(QObject):
                     planner.config.rain_field="forecast" if cfg.rain_source in ("imerg_csv","weather_forecast") else "synthetic_field"
                     if not cfg.modcod_table_path:
                         planner.config.modcod_table=S2_AND_S2X_MODCOD_TABLE if selection_request=="slot_tracking" else DEFAULT_MODCOD_TABLE
+                    planner.state.plans=[];planner.state.execution_plan=None;planner.state.last_result=None
+                    planner.state.generated_at_s=-math.inf
+                if feeder_link_mode_request is not None and planner is not None:
+                    planner.config.feeder_link_mode=feeder_link_mode_request
                     planner.state.plans=[];planner.state.execution_plan=None;planner.state.last_result=None
                     planner.state.generated_at_s=-math.inf
                 if reserve_request is not None and planner is not None:planner.config.capacity_reserve_ratio=reserve_request
@@ -2308,6 +2354,7 @@ class SimulationWorker(QObject):
                         geo_geometry=[cfg.geo_center_longitude_deg,cfg.geo_longitude_spacing_deg,cfg.geo_altitude_km])
                     if planner.config.selection_strategy=="window_margin":offline_spec.update(cache_version=44,algorithm_version=60,objective_formula="weighted_window_mean_capacity_delay_v4",selection_strategy="window_margin",window_sampling="six_points_mean_and_min_rate_v1")
                     if planner.config.selection_strategy=="slot_tracking":offline_spec.update(cache_version=78,algorithm_version=94,selection_strategy="slot_tracking",slot_seconds=60,transition_route_seconds=5,max_slot_pointing_change_deg=planner.config.max_slot_pointing_change_deg,antenna_steering=[planner.config.antenna_steering_type,planner.config.antenna_az_slew_deg_s,planner.config.antenna_el_slew_deg_s,planner.config.antenna_acquisition_s,planner.config.electronic_switch_ms,planner.config.antenna_switch_window_s,planner.config.electronic_scan_from_zenith_deg,planner.config.antenna_az_accel_deg_s2,planner.config.antenna_el_accel_deg_s2],standby_rf_transfer_s=planner.config.standby_rf_transfer_s,antenna_matching="standby_risk_priority_prepoint_view_v28",regional_landing="bounded_end_to_end_delay_v2",modcod_standard="DVB-S2+S2X_normal_frames")
+                    offline_spec["feeder_link_mode"]=planner.config.feeder_link_mode
                     offline_spec_hash=hashlib.sha256(json.dumps(offline_spec,ensure_ascii=False,sort_keys=True,separators=(",",":")).encode("utf-8")).hexdigest()
                     planning_root=cache_root/"planning";planning_root.mkdir(parents=True,exist_ok=True)
                     offline_cache_path=planning_root/f"{offline_spec_hash[:24]}.json"
@@ -2696,10 +2743,14 @@ class SimulationWorker(QObject):
                 traffic_by_satellite={int(row[0]):float(row[1]) for row in satellite_traffic}
                 priority_traffic={sid:min(amount,traffic_by_satellite.get(sid,amount)) for sid,amount in priority_traffic.items()}
                 timings["priority_ms"]=round((time.perf_counter()-stage_start)*1000,1)
+                stage_start=time.perf_counter()
                 planning = planner.update(sim_time, positions, links, gsls, satellite_traffic,
                     priority_traffic=priority_traffic,priority_traffic_regions=priority_regions) if planner else None
+                timings["planner_update_ms"]=round((time.perf_counter()-stage_start)*1000,1)
+                audit_started=time.perf_counter()
                 if planning and planner.config.selection_strategy=="slot_tracking":
                     self._write_frame_pointing_audit(frame_index,sim_time,positions,planning,planner)
+                timings["pointing_audit_ms"]=round((time.perf_counter()-audit_started)*1000,1)
                 timings["dispatch_ms"]=round((time.perf_counter()-stage_start)*1000,1)
                 # Keep the historical key for existing diagnostics consumers.
                 timings["planning_ms"]=timings["dispatch_ms"]
@@ -2716,6 +2767,8 @@ class SimulationWorker(QObject):
                     diagnostic={
                       "generation":planning.get("generation",0),"planning_event":bool(planning.get("planning_event")),
                       "dispatch_ms":timings["dispatch_ms"],
+                      "planner_update_ms":timings["planner_update_ms"],
+                      "pointing_audit_ms":timings["pointing_audit_ms"],
                       "initial_evaluation_ms":context.get("initial_evaluation_ms",0),
                       "final_evaluation_ms":context.get("final_evaluation_ms",0),
                       "route_search_ms":context.get("route_search_ms",0),
@@ -2858,6 +2911,8 @@ class SimulationWorker(QObject):
         except Exception as exc:
             self.failed.emit(f"{type(exc).__name__}: {exc}")
         finally:
+            try:self._flush_frame_pointing_audit()
+            except Exception as exc:self.failed.emit(f"天线指向审计保存失败：{type(exc).__name__}: {exc}")
             if "gc_was_enabled" in locals() and gc_was_enabled and not gc.isenabled():
                 gc.enable()
             gc.collect()
@@ -3118,6 +3173,8 @@ class MainWindow(QMainWindow):
             self.planning_capacity_reserve.setValue(float(data.get("planning_capacity_reserve_percent",20)))
             strategy_index=self.planning_strategy.findData(str(data.get("planning_selection_strategy","legacy")))
             self.planning_strategy.setCurrentIndex(max(0,strategy_index))
+            feeder_mode_index=self.feeder_link_mode.findData(str(data.get("feeder_link_mode","single")))
+            self.feeder_link_mode.setCurrentIndex(max(0,feeder_mode_index))
             self.planning_capacity_weight.setValue(100*float(data.get("planning_capacity_weight",.5)))
             self.fast_evaluation_period.setValue(float(data.get("fast_evaluation_period_s",1)))
             self.fast_adjust_period.setValue(1.0)
@@ -3435,10 +3492,15 @@ class MainWindow(QMainWindow):
         pf.addRow("方案生效间隔",self.planning_period);pf.addRow("方案覆盖时长",self.planning_horizon);pf.addRow("规划容量余量",self.planning_capacity_reserve)
         self.planning_strategy=QComboBox();self.planning_strategy.addItem("容量可行优先时延", "legacy");self.planning_strategy.addItem("容量时延加权", "window_margin");self.planning_strategy.addItem("五分钟连续规划·空间雨强场", "slot_tracking")
         self.planning_strategy.setCurrentIndex(2)
+        self.feeder_link_mode=QComboBox()
+        self.feeder_link_mode.addItem("单星单馈电链路（现有方案）","single")
+        self.feeder_link_mode.addItem("单星双馈电链路（同站或跨站）","dual")
+        self.feeder_link_mode.setToolTip("每颗馈电卫星最多两条独立链路，以正交极化建模；可接同站或不同站，并分别占用站端天线与通道。")
         self.planning_strategy.setToolTip("逐时隙方案每60秒选择馈电星，并约束同一天线与上一时隙的指向变化；该约束跨越五分钟规划周期。")
         self.planning_capacity_weight=self._spin(0,100,50,0," %")
         self.planning_capacity_weight.setToolTip("容量权重；时延权重自动取剩余百分比。固定方案使用五分钟窗口速率；逐时隙方案使用当前时隙链路速率。")
         self.planning_capacity_weight.setEnabled(True)
+        pf.addRow("馈电链路方案",self.feeder_link_mode)
         self.planning_strategy.currentIndexChanged.connect(lambda: self.planning_capacity_weight.setEnabled(self.planning_strategy.currentData() in ("window_margin","slot_tracking")))
         pf.addRow("选星策略",self.planning_strategy);pf.addRow("容量权重",self.planning_capacity_weight)
         self.max_slot_pointing_change=self._spin(1,90,30,1," °/时隙")
@@ -4154,7 +4216,11 @@ class MainWindow(QMainWindow):
         if self.fast_adjust_period.value()<self.fast_evaluation_period.value():raise ValueError("快环调整间隔不能短于状态评估周期")
         capacity_weight=self.planning_capacity_weight.value()/100.0 if self.planning_strategy.currentData() in ("window_margin","slot_tracking") else 0.0
         delay_weight=1.0-capacity_weight if self.planning_strategy.currentData() in ("window_margin","slot_tracking") else 0.0
-        return SimulationConfig(source,tle,satellite_count,plane_count,walker_layout,self.altitude.value(),self.inclination.value(),eccentricity,self.arg_perigee.value(),self.duration.value(),self.step.value(),speed,self.lat_limit.value(),self.elevation.value(),0.0,self.max_isl.value(),isl_pattern,seam_enabled,seam_after_plane,stations,self.center_plane.value()-1,display_count,self.show_sat.isChecked(),self.show_same.isChecked(),self.show_cross.isChecked(),self.show_gsl.isChecked(),self.show_motion.isChecked(),self.show_labels.isChecked(),self.traffic_enabled.isChecked(),traffic_path,self.traffic_dense_percentile.value(),self.traffic_dense_max_satellites.value(),self.traffic_random_sigma.value(),self.traffic_outside_china_percent.value(),self.traffic_total_gbps.value(),self.traffic_cluster_radius.value(),self.planning_enabled.isChecked(),self.planning_period.value(),self.feeder_bandwidth.value(),self.snr_margin.value(),modcod_path,85.0,self.switching_loss.value(),self.rain_enabled.isChecked(),rain_sources[self.rain_source.currentIndex()],rain_sigmas[self.rain_sense.currentIndex()],self.rain_forecast.value(),self.rain_p90.isChecked(),self.satellite_antennas.value(),self.satellite_channels.value(),self.satellite_channel_capacity.value(),self.geo_interference.isChecked(),self.gateway_eirp.value(),self.gateway_gt.value(),self.gateway_array_loss.value(),walker_mode,walker_shells,"","",self.gateway_planning_enabled.isChecked(),5,self.gateway_max_sites.value(),self.gateway_redundancy.value(),self.gateway_max_antennas.value(),gateway_mode,self.planning_horizon.value(),self.planning_slot.value(),self.fast_evaluation_period.value(),self.fast_adjust_period.value(),self.route_update_period.value(),30.0,self.traffic_landing_percent.value(),self.geo_satellite_count.value(),self.geo_center_longitude.value(),self.geo_longitude_spacing.value(),self.geo_altitude.value(),self.gso_i_over_n.value(),self.gso_protection_angle.value(),self.planning_capacity_reserve.value(),self._priority_regions(),capacity_weight,delay_weight,self.feeder_frequency.value(),self.feeder_rolloff.value(),self.satellite_eirp.value(),self.planning_strategy.currentData(),forecast_data,self._simulation_start_utc())
+        if self.feeder_link_mode.currentData()=="dual" and min(self.satellite_antennas.value(),self.satellite_channels.value())<2:
+            raise ValueError("单星双馈电链路需要至少2副卫星天线和2个卫星通道")
+        config=SimulationConfig(source,tle,satellite_count,plane_count,walker_layout,self.altitude.value(),self.inclination.value(),eccentricity,self.arg_perigee.value(),self.duration.value(),self.step.value(),speed,self.lat_limit.value(),self.elevation.value(),0.0,self.max_isl.value(),isl_pattern,seam_enabled,seam_after_plane,stations,self.center_plane.value()-1,display_count,self.show_sat.isChecked(),self.show_same.isChecked(),self.show_cross.isChecked(),self.show_gsl.isChecked(),self.show_motion.isChecked(),self.show_labels.isChecked(),self.traffic_enabled.isChecked(),traffic_path,self.traffic_dense_percentile.value(),self.traffic_dense_max_satellites.value(),self.traffic_random_sigma.value(),self.traffic_outside_china_percent.value(),self.traffic_total_gbps.value(),self.traffic_cluster_radius.value(),self.planning_enabled.isChecked(),self.planning_period.value(),self.feeder_bandwidth.value(),self.snr_margin.value(),modcod_path,85.0,self.switching_loss.value(),self.rain_enabled.isChecked(),rain_sources[self.rain_source.currentIndex()],rain_sigmas[self.rain_sense.currentIndex()],self.rain_forecast.value(),self.rain_p90.isChecked(),self.satellite_antennas.value(),self.satellite_channels.value(),self.satellite_channel_capacity.value(),self.geo_interference.isChecked(),self.gateway_eirp.value(),self.gateway_gt.value(),self.gateway_array_loss.value(),walker_mode,walker_shells,"","",self.gateway_planning_enabled.isChecked(),5,self.gateway_max_sites.value(),self.gateway_redundancy.value(),self.gateway_max_antennas.value(),gateway_mode,self.planning_horizon.value(),self.planning_slot.value(),self.fast_evaluation_period.value(),self.fast_adjust_period.value(),self.route_update_period.value(),30.0,self.traffic_landing_percent.value(),self.geo_satellite_count.value(),self.geo_center_longitude.value(),self.geo_longitude_spacing.value(),self.geo_altitude.value(),self.gso_i_over_n.value(),self.gso_protection_angle.value(),self.planning_capacity_reserve.value(),self._priority_regions(),capacity_weight,delay_weight,self.feeder_frequency.value(),self.feeder_rolloff.value(),self.satellite_eirp.value(),self.planning_strategy.currentData(),forecast_data,self._simulation_start_utc())
+        config.feeder_link_mode=self.feeder_link_mode.currentData()
+        return config
     @Slot()
     def _apply_scheduling_parameters(self):
         if self.fast_adjust_period.value()<self.fast_evaluation_period.value():
@@ -4274,11 +4340,12 @@ class MainWindow(QMainWindow):
             self.active_config.planning_delay_weight=delay
             self.active_config.planning_capacity_reserve_percent=self.planning_capacity_reserve.value()
             self.active_config.planning_selection_strategy=strategy
+            self.active_config.feeder_link_mode=self.feeder_link_mode.currentData()
         steering=(self.antenna_steering_type.currentData(),self.antenna_az_speed.value(),self.antenna_el_speed.value(),
                   self.antenna_acquisition.value(),self.antenna_electronic_latency.value(),self.antenna_switch_window.value(),
                   self.antenna_electronic_scan.value(),self.antenna_az_accel.value(),self.antenna_el_accel.value())
         angle_limit=self.max_slot_pointing_change.value() if self.pointing_limit_mode.currentData()=="angle" else 0.
-        self.worker.request_offline_planning(capacity,delay,self.planning_capacity_reserve.value()/100.0,strategy,angle_limit,steering)
+        self.worker.request_offline_planning(capacity,delay,self.planning_capacity_reserve.value()/100.0,strategy,angle_limit,steering,self.feeder_link_mode.currentData())
 
     def _populate_planning_choices(self,catalog):
         previous=self.offline_rain_grade.currentData() or "站点配置"
@@ -4766,6 +4833,7 @@ class MainWindow(QMainWindow):
             def compact_routes(rows):
                 priority_rows=(row for row in rows if float(row.get("priority_gbps",0))>1e-9)
                 return [{"source":int(row["source"]),"feeder":int(row["feeder"]),
+                         "gateway":row.get("gateway"),"feeder_port":row.get("feeder_port"),
                          "path":row.get("path",[]),"priority_gbps":float(row["priority_gbps"])}
                         for row in sorted(priority_rows,key=lambda item:float(item.get("priority_gbps",0)),reverse=True)[:route_limit]]
             planning=dict(planning)
@@ -4776,7 +4844,7 @@ class MainWindow(QMainWindow):
                             for link in source_run.get("active_links",[])}
             station_delay={}
             for route in source_run.get("routes",[]):
-                gateway=feeder_gateway.get(int(route.get("feeder",-1)))
+                gateway=route.get("gateway",feeder_gateway.get(int(route.get("feeder",-1))))
                 if gateway is None:continue
                 amount=max(0.,float(route.get("demand_gbps",0)))
                 weighted,volume=station_delay.get(gateway,(0.,0.))
@@ -5012,7 +5080,10 @@ class MainWindow(QMainWindow):
             needed_positions.add(feeder)
             position_by_id={int(row[0]):row for row in frame.get("satellites",[]) if int(row[0]) in needed_positions}
             points=[[sid,position_by_id[sid][2],position_by_id[sid][3],position_by_id[sid][4]] for sid in path if sid in position_by_id]
-            feeder_link=next((x for x in run.get("active_links",[]) if int(x.get("satellite",-1))==feeder),None)
+            feeder_link=next((x for x in run.get("active_links",[])
+                if int(x.get("satellite",-1))==feeder
+                and (route.get("gateway") is None or int(x.get("gateway",-1))==int(route["gateway"]))
+                and int(x.get("feeder_port",1))==int(route.get("feeder_port",1))),None)
             segments=[]
             for index,(a,b) in enumerate(zip(path,path[1:])):
                 row_a=position_by_id.get(a);row_b=position_by_id.get(b);key=(min(a,b),max(a,b))
@@ -5339,15 +5410,15 @@ class MainWindow(QMainWindow):
                     for plan in planning.get("plans",[]):
                         w.writerow([plan["id"],plan["name"],plan["id"]==planning.get("active_plan_id"),len(plan["links"]),plan["gateway_count"],plan["total_capacity_gbps"],plan["total_demand_gbps"],plan["reachable_demand_gbps"],plan["average_hops"],plan.get("business_weighted_hops",0),plan.get("business_propagation_delay_ms",0),plan.get("p95_propagation_delay_ms",0),plan.get("maximum_propagation_delay_ms",0),plan.get("latency_scope","")])
                 with (out/"current_planning_routes.csv").open("w",newline="",encoding="utf-8-sig") as f:
-                    w=csv.writer(f);w.writerow(["plan_id","source_satellite","feeder_satellite","isl_hops","distance_km","demand_gbps","path"])
+                    w=csv.writer(f);w.writerow(["plan_id","source_satellite","feeder_satellite","gateway_id","feeder_port","isl_hops","distance_km","demand_gbps","path"])
                     for plan in planning.get("plans",[]):
-                        for route in plan.get("routes",[]):w.writerow([plan["id"],route["source"],route["feeder"],route["hops"],route["distance_km"],route["demand_gbps"],"->".join(map(str,route["path"]))])
+                        for route in plan.get("routes",[]):w.writerow([plan["id"],route["source"],route["feeder"],route.get("gateway",""),route.get("feeder_port",1),route["hops"],route["distance_km"],route["demand_gbps"],"->".join(map(str,route["path"]))])
                 with (out/"current_schedule_links.csv").open("w",newline="",encoding="utf-8-sig") as f:
-                    w=csv.writer(f); w.writerow(["gateway_id","gateway_name","satellite_id","elevation_deg","snr_db","modcod","array_mode_m","power_factor_rho","rate_gbps","scheduled_gbps","utilization","belongs_to_slow_plan","fast_loop_substitute"])
-                    plan=planning.get("active_plan") or {};planned={(x["gateway"],x["satellite"]) for x in plan.get("links",[])}
+                    w=csv.writer(f); w.writerow(["gateway_id","gateway_name","satellite_id","feeder_port","elevation_deg","snr_db","modcod","array_mode_m","power_factor_rho","rate_gbps","scheduled_gbps","utilization","belongs_to_slow_plan","fast_loop_substitute"])
+                    plan=planning.get("active_plan") or {};planned={(x["gateway"],x["satellite"],x.get("feeder_port",1)) for x in plan.get("links",[])}
                     for actual in (planning.get("active_evaluation") or {}).get("active_links",[]):
-                        gid=actual["gateway"];pair=(gid,actual["satellite"])
-                        w.writerow([gid,station_names[gid],actual["satellite"],actual["elevation_deg"],actual["snr_db"],actual["modcod"],actual.get("array_mode",1),actual.get("power_factor",1),actual["rate_gbps"],actual.get("scheduled_gbps",0),actual.get("utilization",0),pair in planned,actual.get("is_substitute",False)])
+                        gid=actual["gateway"];port=actual.get("feeder_port",1);pair=(gid,actual["satellite"],port)
+                        w.writerow([gid,station_names[gid],actual["satellite"],port,actual["elevation_deg"],actual["snr_db"],actual["modcod"],actual.get("array_mode",1),actual.get("power_factor",1),actual["rate_gbps"],actual.get("scheduled_gbps",0),actual.get("utilization",0),pair in planned,actual.get("is_substitute",False)])
             QMessageBox.information(self,"导出完成",f"已导出到：\n{out}")
             self.status.setText(f"结果已导出到 {out}")
         except Exception as exc:

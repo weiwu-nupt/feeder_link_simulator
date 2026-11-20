@@ -126,6 +126,7 @@ class PlannerConfig:
     planning_exit_limit_per_source:int=8
     realtime_exit_limit_per_source:int=8
     selection_strategy:str="legacy"
+    feeder_link_mode:str="single"
     rain_field:str="synthetic_field"
     # Zero uses antenna hardware limits without an arbitrary inter-slot angle cap.
     max_slot_pointing_change_deg:float=0.
@@ -289,6 +290,52 @@ def _component_delivery_bound(node_count,edges,demands,active_links):
         capacity_by_component[component]=capacity_by_component.get(component,0.)+max(0.,float(link.get("rate_gbps",0)))
     return sum(min(demand,capacity_by_component.get(component,0.))
                for component,demand in demand_by_component.items())
+
+def _feeder_resources(links):
+    """Aggregate parallel gateway links without losing their capacity."""
+    capacities={};distances={}
+    for link in links:
+        satellite=int(link["satellite"])
+        rate=max(0.,float(link.get("rate_gbps",0.)))
+        capacities[satellite]=capacities.get(satellite,0.)+rate
+        distance=float(link.get("gsl_distance_km",0.))
+        distances[satellite]=min(distances.get(satellite,distance),distance)
+    return capacities,distances
+
+def _bind_routes_to_links(routes,links):
+    """Assign each feeder-satellite route to real gateway links and their capacities."""
+    by_satellite={};spare={};used={}
+    for link in links:
+        satellite=int(link["satellite"])
+        key=(int(link["gateway"]),satellite,int(link.get("feeder_port",1)))
+        by_satellite.setdefault(satellite,[]).append(link)
+        spare[key]=max(0.,float(link.get("rate_gbps",0.)))
+        used[key]=0.
+    bound=[]
+    for route in routes:
+        satellite=int(route.get("feeder",-1))
+        preferred=route.get("gateway")
+        options=sorted(by_satellite.get(satellite,()),key=lambda link:(
+            0 if preferred is not None and int(link["gateway"])==int(preferred) else 1,
+            float(link.get("gsl_distance_km",0.))))
+        left=max(0.,float(route.get("demand_gbps",0.)))
+        priority_left=max(0.,float(route.get("priority_gbps",0.)))
+        for link in options:
+            key=(int(link["gateway"]),satellite,int(link.get("feeder_port",1)))
+            amount=min(left,spare[key])
+            if amount<=1e-9:continue
+            item=route.copy();item["demand_gbps"]=round(amount,6)
+            item["gateway"]=key[0];item["feeder_port"]=key[2]
+            gsl_km=float(link.get("gsl_distance_km",0.))
+            item["gsl_distance_km"]=round(gsl_km,3)
+            item["gsl_propagation_delay_ms"]=round(gsl_km/C_KM_PER_MS,4)
+            item["propagation_delay_ms"]=round((float(item.get("distance_km",0.))+gsl_km)/C_KM_PER_MS,4)
+            if "priority_gbps" in item:
+                item["priority_gbps"]=round(min(amount,priority_left),6)
+                priority_left=max(0.,priority_left-amount)
+            bound.append(item);spare[key]-=amount;used[key]+=amount;left-=amount
+            if left<=1e-9:break
+    return bound,used
 
 def _k_nearest_candidate_options(g,candidates,demands,k=3):
     """Return at most K reachable feeder choices for every traffic satellite.
@@ -727,8 +774,11 @@ def _gsl_distance_km(altitude_m,elevation_deg):
 
 def _attach_feeder_delay(routes,links):
     feeder_links={int(x["satellite"]):x for x in links}
+    pair_links={(int(x["gateway"]),int(x["satellite"]),int(x.get("feeder_port",1))):x for x in links}
     for route in routes:
-        link=feeder_links.get(int(route.get("feeder",-1)));gsl_distance=float((link or {}).get("gsl_distance_km",0))
+        key=(int(route.get("gateway",-1)),int(route.get("feeder",-1)),int(route.get("feeder_port",1)))
+        link=pair_links.get(key) or feeder_links.get(int(route.get("feeder",-1)))
+        gsl_distance=float((link or {}).get("gsl_distance_km",0))
         route["gsl_distance_km"]=round(gsl_distance,3)
         route["gsl_propagation_delay_ms"]=round(gsl_distance/C_KM_PER_MS,4)
         route["propagation_delay_ms"]=round(float(route.get("isl_propagation_delay_ms",0))+gsl_distance/C_KM_PER_MS,4)
@@ -805,7 +855,8 @@ class SlowFastLoopPlanner:
         channels=max(0,int(station.get("channel_count",station.get("antenna_count",20))))
         return min(channels,max(0,int(station.get("antenna_count",channels))))
     def _regional_feeders(self,links,plan=None):
-        by_satellite={int(link["satellite"]):link for link in links}
+        by_satellite={}
+        for link in links:by_satellite.setdefault(int(link["satellite"]),[]).append(link)
         result={}
         preferred_by_region=(plan or {}).get("priority_feeders_by_region") or {}
         for region in self.config.priority_task_regions:
@@ -813,9 +864,10 @@ class SlowFastLoopPlanner:
             preferred={int(satellite) for satellite in preferred_by_region.get(name,[])}
             usable=preferred.intersection(by_satellite)
             if not usable and by_satellite:
-                distances={satellite:_surface_distance_km(
+                distances={satellite:min(_surface_distance_km(
                     self.stations[int(link["gateway"])]["lat"],self.stations[int(link["gateway"])]["lon"],
-                    region["lat"],region["lon"]) for satellite,link in by_satellite.items()}
+                    region["lat"],region["lon"]) for link in rows)
+                    for satellite,rows in by_satellite.items()}
                 nearest=min(distances.values())
                 usable={satellite for satellite,distance in distances.items() if distance<=nearest+100.}
             result[name]=usable
@@ -876,12 +928,12 @@ class SlowFastLoopPlanner:
             remaining={i:self._gateway_limit(i) for i,_s in enumerate(self.stations)}
             unmet={int(source):float(value) for source,value in demands.items()}
             priority_unmet={int(source):min(float(value),unmet.get(int(source),0.)) for source,value in (priority_demands or {}).items()}
-            selected=[];used=set();available=set(range(len(candidates)))
+            selected=[];used={};available=set(range(len(candidates)))
             while available and sum(remaining.values())>0 and sum(unmet.values())>1e-12:
                 evaluated=[]
                 for index in tuple(available):
                     item=candidates[index];gateway=int(item["gateway"]);satellite=int(item["satellite"])
-                    if remaining.get(gateway,0)<=0 or satellite in used:continue
+                    if remaining.get(gateway,0)<=0 or used.get(satellite,0)>=(2 if self.config.feeder_link_mode=="dual" else 1):continue
                     capacity=max(0.,float(item["rate_gbps"]));delivered=0.;weighted_delay=0.;allocation=[];assigned={};priority_gain=0.;priority_weighted_delay=0.
                     for priority_pass in (True,False):
                         for source,_demand,delay in options[index]:
@@ -987,17 +1039,22 @@ class SlowFastLoopPlanner:
                     delay_score=margin_scores[index][2]
                     window_capacity=margin_scores[index][3]
                 item=candidates[index].copy()
+                item["feeder_port"]=used.get(int(item["satellite"]),0)+1
+                if self.config.feeder_link_mode=="dual":
+                    item["polarization"]="RHCP" if item["feeder_port"]==1 else "LHCP"
                 item.update(selection_score=round(rank[0],9),capacity_score=round(capacity_score,9),delay_score=round(delay_score,9),
                             delay_gain=round(delay_gain,9),
                             estimated_weighted_delay_ms=round(average_delay,6),assigned_demand_gbps=round(sum(x[1] for x in allocation),6),
                             diversity_score=round(diversity,6),minimum_angular_separation_deg=round(minimum_angle,3),
                              orbital_plane_bonus=round(plane_bonus,3),priority_assigned_gbps=round(priority_gain,6),selection_reason=("重点业务优先、可行出口就近" if priority_gain>1e-9 else "五分钟平均容量与时延加权" if self.config.selection_strategy=="window_margin" else "容量可行集内优先时延"))
                 if window_capacity is not None:item["estimated_window_capacity_gbps"]=round(window_capacity,6)
-                selected.append(item);remaining[item["gateway"]]-=1;used.add(item["satellite"]);available.discard(index)
+                selected.append(item);remaining[item["gateway"]]-=1
+                used[item["satellite"]]=used.get(item["satellite"],0)+1
                 for source,amount,_delay in allocation:
                     unmet[source]=max(0.,unmet.get(source,0.)-amount)
                     priority_unmet[source]=max(0.,priority_unmet.get(source,0.)-amount)
-                available={i for i in available if candidates[i]["satellite"]!=item["satellite"]}
+                if used[item["satellite"]]>=(2 if self.config.feeder_link_mode=="dual" else 1):
+                    available={i for i in available if candidates[i]["satellite"]!=item["satellite"]}
             can_expand=bool(available) and sum(remaining.values())>0
             return selected,sum(unmet.values()),can_expand,unmet
         # One bounded multi-label graph pass is enough for the joint score.
@@ -1013,7 +1070,7 @@ class SlowFastLoopPlanner:
         # K-nearest pruning must never leave usable station resources idle while
         # landing demand remains. Fill residual quotas with the best remaining
         # capacity/latency candidates using one demand-to-network distance pass.
-        if best_unmet>1e-9 and self.config.selection_strategy not in ("window_margin","slot_tracking"):
+        if best_unmet>1e-9 and self.config.feeder_link_mode!="dual" and self.config.selection_strategy not in ("window_margin","slot_tracking"):
             used={int(item["satellite"]) for item in best_selected}
             remaining={i:max(0,self._gateway_limit(i)-sum(int(x["gateway"])==i for x in best_selected)) for i,_s in enumerate(self.stations)}
             component_unmet={}
@@ -1052,12 +1109,13 @@ class SlowFastLoopPlanner:
         total=sum(float(item.get("rate_gbps",0)) for item in selected)
         if total+1e-9>=target:return selected,total,True
         component_demand=_component_demand(g,demands);nearest=_nearest_demand_distance(g,demands)
-        used={int(item["satellite"]) for item in selected}
+        used={satellite:sum(int(item["satellite"])==satellite for item in selected)
+              for satellite in {int(item["satellite"]) for item in selected}}
         while total+1e-9<target:
             best=None
             for candidate in candidates:
                 satellite=int(candidate["satellite"]);gateway=int(candidate["gateway"])
-                if satellite in used or component_demand[satellite]<=0:continue
+                if used.get(satellite,0)>=(2 if self.config.feeder_link_mode=="dual" else 1) or component_demand[satellite]<=0:continue
                 same_gateway=[(index,item) for index,item in enumerate(selected) if int(item["gateway"])==gateway]
                 channel_limit=self._gateway_limit(gateway)
                 if len(same_gateway)<channel_limit:
@@ -1072,10 +1130,15 @@ class SlowFastLoopPlanner:
             if best is None:break
             gain,replace_index,candidate=best[0][0],best[1],dict(best[2])
             candidate["selection_reason"]="容量余量硬约束补强"
+            candidate["feeder_port"]=used.get(int(candidate["satellite"]),0)+1
+            if self.config.feeder_link_mode=="dual":
+                candidate["polarization"]="RHCP" if candidate["feeder_port"]==1 else "LHCP"
             if replace_index is None:selected.append(candidate)
             else:
-                used.discard(int(selected[replace_index]["satellite"]));selected[replace_index]=candidate
-            used.add(int(candidate["satellite"]));total+=gain
+                old_satellite=int(selected[replace_index]["satellite"])
+                used[old_satellite]=max(0,used.get(old_satellite,0)-1)
+                selected[replace_index]=candidate
+            sat=int(candidate["satellite"]);used[sat]=used.get(sat,0)+1;total+=gain
         return selected,total,total+1e-9>=target
     def _retain_slot_links(self,chosen,candidates,previous_plan,graph,demands,capacity_target,reference_time_s):
         """Start each slot from usable feeders and limit voluntary handovers."""
@@ -1218,7 +1281,8 @@ class SlowFastLoopPlanner:
         for gateway in gateways:
             rows=[dict(row) for row in chosen if int(row["gateway"])==gateway]
             prior=previous.get(gateway,{})
-            prior_antenna_by_satellite={int(old["satellite"]):antenna_id for antenna_id,old in prior.items()}
+            prior_antenna_by_satellite={(int(old["satellite"]),int(old.get("feeder_port",1))):antenna_id
+                                        for antenna_id,old in prior.items()}
             active_limit=self._gateway_limit(gateway)
             antenna_count=max(0,int(self.stations[gateway].get("antenna_count",active_limit)))
             has_spare_antennas=antenna_count>active_limit
@@ -1235,7 +1299,7 @@ class SlowFastLoopPlanner:
                 for antenna_id in range(antenna_count):
                     # A continuing link belongs to the same antenna throughout
                     # its pass; it cannot be reassigned as a fresh acquisition.
-                    continuing_antenna=prior_antenna_by_satellite.get(int(row["satellite"]))
+                    continuing_antenna=prior_antenna_by_satellite.get((int(row["satellite"]),int(row.get("feeder_port",1))))
                     if continuing_antenna is not None and antenna_id!=continuing_antenna:continue
                     old=prior.get(antenna_id)
                     if old is None:
@@ -1268,7 +1332,9 @@ class SlowFastLoopPlanner:
             locked={}
             locked_antennas=set()
             for index,row in enumerate(rows):
-                fixed_antenna=(fixed_assignments or {}).get((gateway,int(row["satellite"])))
+                fixed_antenna=(fixed_assignments or {}).get((gateway,int(row["satellite"]),int(row.get("feeder_port",1))))
+                if fixed_antenna is None and self.config.feeder_link_mode!="dual":
+                    fixed_antenna=(fixed_assignments or {}).get((gateway,int(row["satellite"])))
                 if fixed_antenna is not None and any(item[2]==fixed_antenna for item in options[index]):
                     locked[index]=fixed_antenna
                     locked_antennas.add(fixed_antenna)
@@ -1493,7 +1559,8 @@ class SlowFastLoopPlanner:
             target_satisfied=selected_capacity+1e-9>=capacity_target
         handover={}
         if self.config.selection_strategy=="slot_tracking":
-            chosen=self._retain_slot_links(chosen,candidates,previous_plan,g,demands,capacity_target,t)
+            if self.config.feeder_link_mode!="dual":
+                chosen=self._retain_slot_links(chosen,candidates,previous_plan,g,demands,capacity_target,t)
             primary,handover=self._assign_slot_antennas(chosen,previous_plan,t,graph=g)
             # Give the antenna matcher fallback satellites before it drops an
             # infeasible first choice and leaves an otherwise usable antenna idle.
@@ -1510,13 +1577,14 @@ class SlowFastLoopPlanner:
                     satellite=int(candidate["satellite"])
                     if satellite not in selected_satellites:
                         fallback.append(candidate);selected_satellites.add(satellite)
-            fixed={(int(row["gateway"]),int(row["satellite"])):int(row["antenna_id"]) for row in primary}
+            fixed={(int(row["gateway"]),int(row["satellite"]),int(row.get("feeder_port",1))):int(row["antenna_id"])
+                   for row in primary}
             chosen,handover=self._assign_slot_antennas(primary+fallback,previous_plan,t,fixed,graph=g)
             # The generic matcher can still omit the last feeder in a
             # priority-bearing ISL component.  Try a physically feasible
             # one-for-one replacement while locking every other antenna.
             regional_rescues=0
-            if priority_traffic_regions and self.config.priority_task_regions:
+            if self.config.feeder_link_mode!="dual" and priority_traffic_regions and self.config.priority_task_regions:
                 component_ids=_component_ids(g)
                 for region in self.config.priority_task_regions:
                     loads=(priority_traffic_regions or {}).get(str(region.get("name","")),{})
@@ -1563,7 +1631,7 @@ class SlowFastLoopPlanner:
                 component_demands[component]=component_demands.get(component,0.)+float(amount)
             component_rescues=0
             component_trial_budget=48
-            for _attempt in range(min(8,len(chosen))):
+            for _attempt in range(0 if self.config.feeder_link_mode=="dual" else min(8,len(chosen))):
                 component_capacity={}
                 for link in chosen:
                     component=component_ids[int(link["satellite"])]
@@ -1609,8 +1677,7 @@ class SlowFastLoopPlanner:
             selected_capacity=sum(float(item.get("rate_gbps",0)) for item in chosen)
             target_satisfied=selected_capacity+1e-9>=capacity_target
         selection_compute_ms=round((time.perf_counter()-selection_started)*1000,3)
-        capacities={int(x["satellite"]):float(x["rate_gbps"]) for x in chosen}
-        gsl_distances={int(x["satellite"]):float(x.get("gsl_distance_km",0)) for x in chosen}
+        capacities,gsl_distances=_feeder_resources(chosen)
         routes=[]
         # Offline planning uses one complete bounded search.  The former
         # 8/16/24 sequence rebuilt almost the same multi-source labels three
@@ -1649,7 +1716,7 @@ class SlowFastLoopPlanner:
             return wc*delivery_ratio+wd*latency_quality,delivered,average_delay,p95_delay
         # One bounded repair is enough.  A second complete reroute nearly
         # tripled batch planning time while producing only marginal gains.
-        for _joint_repair in range(0 if self.config.selection_strategy=="window_margin" else 1):
+        for _joint_repair in range(0 if self.config.feeder_link_mode=="dual" or self.config.selection_strategy=="window_margin" else 1):
             allocated={}
             for route in routes:
                 source=int(route.get("source",-1));allocated[source]=allocated.get(source,0.)+float(route.get("demand_gbps",0))
@@ -1695,8 +1762,7 @@ class SlowFastLoopPlanner:
                 assigned,trial_handover=self._assign_slot_antennas(trial,previous_plan,t,fixed,graph=g)
                 if len(assigned)!=len(chosen):break
                 trial=assigned
-            trial_capacities={int(x["satellite"]):float(x["rate_gbps"]) for x in trial}
-            trial_gsl={int(x["satellite"]):float(x.get("gsl_distance_km",0)) for x in trial}
+            trial_capacities,trial_gsl=_feeder_resources(trial)
             trial_routes=_routes_with_capacity_completion(g,trial_capacities,demands,trial_capacities,candidate_count=24,
                          capacity_weight=self.config.capacity_weight,delay_weight=self.config.delay_weight,
                          delay_reference_ms=self.config.delay_reference_ms,feeder_gsl_distances=trial_gsl,
@@ -1721,8 +1787,7 @@ class SlowFastLoopPlanner:
             conservative=self._select(candidates,g,planning_demands,capacity_only=True,priority_demands=priority_demands)
             conservative,conservative_capacity,conservative_target=self._enforce_capacity_target(
                 candidates,conservative,g,planning_demands,capacity_target)
-            conservative_rates={int(item["satellite"]):float(item["rate_gbps"]) for item in conservative}
-            conservative_gsl={int(item["satellite"]):float(item.get("gsl_distance_km",0)) for item in conservative}
+            conservative_rates,conservative_gsl=_feeder_resources(conservative)
             conservative_routes=_routes_with_capacity_completion(
                 g,conservative_rates,demands,conservative_rates,candidate_count=24,
                 capacity_weight=self.config.capacity_weight,delay_weight=self.config.delay_weight,
@@ -1992,6 +2057,8 @@ class SlowFastLoopPlanner:
                 result["target_met"]=bool(1<=len(exits)<=5 and
                     result["delivered_gbps"]>=.99*result["demand_gbps"])
             priority_feeder_ids={feeder for exits in priority_feeders_by_region.values() for feeder in exits}
+        if self.config.feeder_link_mode=="dual":
+            routes,_planned_link_usage=_bind_routes_to_links(routes,chosen)
         _attach_feeder_delay(routes,chosen);avg,bweighted,delay,p95_delay,max_delay=_route_metrics(routes)
         usage=[{"gateway":i,"used":sum(x["gateway"]==i for x in chosen),"available":self._gateway_limit(i)} for i,_s in enumerate(self.stations)]
         routed_business=sum(float(x.get("demand_gbps",0)) for x in routes);total_business=sum(demands.values())
@@ -2008,7 +2075,9 @@ class SlowFastLoopPlanner:
                 feeder=int(row.get("feeder",-1))
                 load_by_feeder[feeder]=load_by_feeder.get(feeder,0.)+float(row.get("demand_gbps",0.))
             for link in chosen:
-                load=load_by_feeder.get(int(link["satellite"]),0.)
+                key=(int(link["gateway"]),int(link["satellite"]),int(link.get("feeder_port",1)))
+                load=(_planned_link_usage.get(key,0.) if self.config.feeder_link_mode=="dual"
+                      else load_by_feeder.get(int(link["satellite"]),0.))
                 link["planned_load_gbps"]=round(load,6)
                 link["planned_window_spare_gbps"]=round(max(0.,float(link["rate_gbps"])-load),6)
         plan={"id":"offline_plan","name":"离线站星连接规划","generated_at_s":t,
@@ -2017,7 +2086,7 @@ class SlowFastLoopPlanner:
           "freeze_until_s":t+self.config.freeze_window_s,"links":chosen,"routes":routes,
           "total_capacity_gbps":round(sum(x["rate_gbps"] for x in chosen),6),"total_demand_gbps":round(sum(demands.values()),6),
           "capacity_reserve_ratio":round(reserve,6),"capacity_target_gbps":round(capacity_target,6),
-          "selection_strategy":self.config.selection_strategy,
+          "selection_strategy":self.config.selection_strategy,"feeder_link_mode":self.config.feeder_link_mode,
           "rain_grade":rain_grade or "中雨","rain_scenario_percentile":None,
           "capacity_target_satisfied":bool(target_satisfied),"capacity_target_gap_gbps":round(max(0.,capacity_target-selected_capacity),6),
           "traffic_satellite_count":len(demands),
@@ -2062,7 +2131,8 @@ class SlowFastLoopPlanner:
             plan["objective_formula"]="lexicographic: satisfy capacity and gateway quotas; minimize path delay"
         objective_rows=[x for x in chosen if "selection_score" in x]
         plan["objective_diagnostics"]={
-          "selected_signature":[[int(x["gateway"]),int(x["satellite"])] for x in chosen],
+          "selected_signature":[[int(x["gateway"]),int(x["satellite"]),int(x.get("feeder_port",1))]
+              if self.config.feeder_link_mode=="dual" else [int(x["gateway"]),int(x["satellite"])] for x in chosen],
           "selected_link_count":len(chosen),
           "selected_rate_gbps":round(sum(float(x.get("rate_gbps",0)) for x in chosen),6),
           "assigned_demand_gbps":round(sum(float(x.get("assigned_demand_gbps",0)) for x in chosen),6),
@@ -2142,21 +2212,19 @@ class SlowFastLoopPlanner:
                 if start is None or begin+1e-9>=start+float(row.get("estimated_switch_s") or 0.) or (
                     (self.config.antenna_steering_type=="electronic" or row.get("handover_from_antenna_id") is not None)
                     and end+1e-9>=start+float(row.get("estimated_switch_s") or 0.)):
-                    usable[int(row["satellite"])]=row
+                    usable[(gateway,int(antenna) if antenna is not None else -1,int(row["satellite"]))]=row
                 elif begin<start+float(row.get("estimated_switch_s") or 0.) and (
                     old:=previous_by_antenna.get((gateway,int(row["handover_from_antenna_id"]))
                         if row.get("handover_from_antenna_id") is not None else key)) is not None:
-                    usable[int(old["satellite"])]=old
+                    usable[(gateway,int(old.get("antenna_id",-1)),int(old["satellite"]))]=old
                     waiting_old_feeders.add(int(old["satellite"]))
-            capacities={satellite:float(row.get("rate_gbps",0)) for satellite,row in usable.items()
-                        if float(row.get("rate_gbps",0))>0}
-            gsl={satellite:float(row.get("gsl_distance_km",0)) for satellite,row in usable.items()}
+            capacities,gsl=_feeder_resources(usable.values())
             local={}
             for region_name,region_loads in (priority_traffic_regions or {}).items():
                 region=next((item for item in self.config.priority_task_regions
                     if str(item.get("name"))==str(region_name)),None)
                 if region is None:continue
-                nearby={satellite for satellite,row in usable.items() if
+                nearby={int(row["satellite"]) for row in usable.values() if
                     _surface_distance_km(row.get("latitude_deg",0),row.get("longitude_deg",0),
                         region["lat"],region["lon"])<=float(region["radius_km"])}
                 for source,amount in region_loads.items():
@@ -2218,7 +2286,7 @@ class SlowFastLoopPlanner:
             if switch_start is not None:
                 until=switch_start+float(new.get("estimated_switch_s") or 0.)
                 new["scheduled_switch_start_s"]=round(switch_start,3)
-                switch_until[(gateway,satellite)]=until
+                switch_until[(gateway,satellite,int(new.get("feeder_port",1)))]=until
                 old_key=(gateway,int(new["handover_from_antenna_id"])) if new.get("handover_from_antenna_id") is not None else key
                 if old_key in previous_by_antenna:
                     old=dict(previous_by_antenna[old_key])
@@ -2256,52 +2324,64 @@ class SlowFastLoopPlanner:
         self.state.last_feeder_capacities={}
         self.state.last_capacity_reroute_s=-math.inf
 
-    def _evaluate(self,t,plan,pairs,total_demand,edges,current_traffic_satellite_count=None,positions=None,demand_by_source=None):
-        active=[];link_states=[];ideal=float(plan.get("ideal_capacity_override_gbps",
-            sum(x["rate_gbps"] for x in plan["links"])));actual=0
-        for old in plan["links"]:
-            if t+1e-9>=float(old.get("temporary_until_s",math.inf)):
-                continue
-            unavailable_until=self.state.switch_unavailable_until.get((int(old["gateway"]),int(old["satellite"])),0.)
-            if t+1e-9<unavailable_until:
-                switch_start=old.get("scheduled_switch_start_s")
-                waiting=switch_start is not None and t+1e-9<float(switch_start)
-                link_states.append({"gateway":old["gateway"],"satellite":old["satellite"],
-                    "status":"等待切换" if waiting else "备用天线信道转接中" if old.get("handover_from_antenna_id") is not None else "切星捕获中","rate_gbps":0.,
-                    "scheduled_switch_start_s":switch_start,"unavailable_until_s":round(unavailable_until,3)})
-                continue
-            elev=pairs.get((old["gateway"],old["satellite"]))
-            if elev is None:
-                link_states.append({"gateway":old["gateway"],"satellite":old["satellite"],"status":"不可见","rate_gbps":0.})
-                continue
-            grade=plan.get("rain_grade") if plan.get("offline") and self.config.rain_enabled else None
-            rain=({"rain_rate_mmh":0.,"actual_attenuation_db":0.,"severity":grade or "中雨"} if self.config.rain_field=="synthetic_field" else
-                  link_rain_state(self.stations[int(old["gateway"])],elev,t,self.config.rain_enabled,self.config.rain_sense_sigma,self.config.rain_forecast_hours,self.config.rain_use_p90))
-            # Offline scenarios and realtime execution must use the same rain
-            # field. Otherwise a light-rain plan can start with dead links.
-            if grade and self.config.rain_field=="forecast":
-                fade=forecast_rain_attenuation_db(self.stations[int(old["gateway"])],elev,t)
-            elif self.config.rain_enabled and self.config.rain_field=="synthetic_field":
-                fade=synthetic_rain_attenuation_db(self.stations[int(old["gateway"])],elev,grade or "中雨",t,list(positions[int(old["satellite"])]) if positions is not None else None)
-            else:fade=rain["sensed_attenuation_db"]
-            altitude=float(positions[int(old["satellite"])][4])/1000 if positions is not None else self.config.reference_satellite_altitude_km
-            snr,mcs,rate=link_state(elev,self.config,fade,_slant_distance_km(altitude,elev))
-            transfer_start=old.get("standby_transfer_start_s")
-            if transfer_start is not None and t+1e-9>=float(transfer_start):
-                frame_s=max(1e-6,float(self.config.fast_evaluation_period_s))
-                transfer_s=max(0.,float(old.get("standby_transfer_duration_s",0.)))
-                rate*=1.-min(1.,transfer_s/frame_s)
-            if rate<=0:
-                link_states.append({"gateway":old["gateway"],"satellite":old["satellite"],"status":"容量为零","elevation_deg":elev,"rate_gbps":0.,"rain_attenuation_db":fade})
-                continue
-            x=old.copy();x.update(elevation_deg=elev,snr_db=snr,modcod=mcs,rate_gbps=rate,gso_interference_db=round(gso_interference_penalty_db(self.config),3),rain_attenuation_db=fade,rain_actual_db=(fade if self.config.rain_field=="synthetic_field" or grade else rain["actual_attenuation_db"]),rain_rate_mmh=(forecast_rain_rate_mmh(self.stations[int(old["gateway"])],t) if grade and self.config.rain_field=="forecast" else synthetic_surface_rain_rate_mmh(self.stations[int(old["gateway"])],grade or "中雨",t) if self.config.rain_enabled and self.config.rain_field=="synthetic_field" else rain["rain_rate_mmh"]),rain_severity=(self.stations[int(old["gateway"])].get("rain_grade") or grade or rain["severity"]))
-            if positions is not None:x["gsl_distance_km"]=_gsl_distance_km(positions[int(old["satellite"])][4],elev)
-            active.append(x);actual+=rate
-            status="容量下降" if rate<float(old.get("rate_gbps",0))*self.config.capacity_threshold_ratio else "可用"
-            link_states.append({"gateway":old["gateway"],"satellite":old["satellite"],"status":status,"elevation_deg":elev,"rate_gbps":rate,"rain_attenuation_db":fade})
+    def _evaluate(self,t,plan,pairs,total_demand,edges,current_traffic_satellite_count=None,positions=None,demand_by_source=None,link_cache=None):
+        # A fast route repair changes routes, but not this frame's feeder links.
+        # Keep the radio evaluation local to update(); never reuse it across frames.
+        link_key=(id(plan["links"]),plan.get("rain_grade"),bool(plan.get("offline")),
+                  plan.get("ideal_capacity_override_gbps"))
+        cached=link_cache.get(link_key) if link_cache is not None else None
+        if cached is not None:
+            base_links,base_states,ideal,actual=cached
+            active=[row.copy() for row in base_links]
+            link_states=[row.copy() for row in base_states]
+        else:
+            active=[];link_states=[];ideal=float(plan.get("ideal_capacity_override_gbps",
+                sum(x["rate_gbps"] for x in plan["links"])));actual=0
+            for old in plan["links"]:
+                if t+1e-9>=float(old.get("temporary_until_s",math.inf)):
+                    continue
+                unavailable_until=self.state.switch_unavailable_until.get((int(old["gateway"]),int(old["satellite"]),int(old.get("feeder_port",1))),0.)
+                if t+1e-9<unavailable_until:
+                    switch_start=old.get("scheduled_switch_start_s")
+                    waiting=switch_start is not None and t+1e-9<float(switch_start)
+                    link_states.append({"gateway":old["gateway"],"satellite":old["satellite"],
+                        "status":"等待切换" if waiting else "备用天线信道转接中" if old.get("handover_from_antenna_id") is not None else "切星捕获中","rate_gbps":0.,
+                        "scheduled_switch_start_s":switch_start,"unavailable_until_s":round(unavailable_until,3)})
+                    continue
+                elev=pairs.get((old["gateway"],old["satellite"]))
+                if elev is None:
+                    link_states.append({"gateway":old["gateway"],"satellite":old["satellite"],"status":"不可见","rate_gbps":0.})
+                    continue
+                grade=plan.get("rain_grade") if plan.get("offline") and self.config.rain_enabled else None
+                rain=({"rain_rate_mmh":0.,"actual_attenuation_db":0.,"severity":grade or "中雨"} if self.config.rain_field=="synthetic_field" else
+                      link_rain_state(self.stations[int(old["gateway"])],elev,t,self.config.rain_enabled,self.config.rain_sense_sigma,self.config.rain_forecast_hours,self.config.rain_use_p90))
+                # Offline scenarios and realtime execution must use the same rain
+                # field. Otherwise a light-rain plan can start with dead links.
+                if grade and self.config.rain_field=="forecast":
+                    fade=forecast_rain_attenuation_db(self.stations[int(old["gateway"])],elev,t)
+                elif self.config.rain_enabled and self.config.rain_field=="synthetic_field":
+                    fade=synthetic_rain_attenuation_db(self.stations[int(old["gateway"])],elev,grade or "中雨",t,list(positions[int(old["satellite"])]) if positions is not None else None)
+                else:fade=rain["sensed_attenuation_db"]
+                altitude=float(positions[int(old["satellite"])][4])/1000 if positions is not None else self.config.reference_satellite_altitude_km
+                snr,mcs,rate=link_state(elev,self.config,fade,_slant_distance_km(altitude,elev))
+                transfer_start=old.get("standby_transfer_start_s")
+                if transfer_start is not None and t+1e-9>=float(transfer_start):
+                    frame_s=max(1e-6,float(self.config.fast_evaluation_period_s))
+                    transfer_s=max(0.,float(old.get("standby_transfer_duration_s",0.)))
+                    rate*=1.-min(1.,transfer_s/frame_s)
+                if rate<=0:
+                    link_states.append({"gateway":old["gateway"],"satellite":old["satellite"],"status":"容量为零","elevation_deg":elev,"rate_gbps":0.,"rain_attenuation_db":fade})
+                    continue
+                x=old.copy();x.update(elevation_deg=elev,snr_db=snr,modcod=mcs,rate_gbps=rate,gso_interference_db=round(gso_interference_penalty_db(self.config),3),rain_attenuation_db=fade,rain_actual_db=(fade if self.config.rain_field=="synthetic_field" or grade else rain["actual_attenuation_db"]),rain_rate_mmh=(forecast_rain_rate_mmh(self.stations[int(old["gateway"])],t) if grade and self.config.rain_field=="forecast" else synthetic_surface_rain_rate_mmh(self.stations[int(old["gateway"])],grade or "中雨",t) if self.config.rain_enabled and self.config.rain_field=="synthetic_field" else rain["rain_rate_mmh"]),rain_severity=(self.stations[int(old["gateway"])].get("rain_grade") or grade or rain["severity"]))
+                if positions is not None:x["gsl_distance_km"]=_gsl_distance_km(positions[int(old["satellite"])][4],elev)
+                active.append(x);actual+=rate
+                status="容量下降" if rate<float(old.get("rate_gbps",0))*self.config.capacity_threshold_ratio else "可用"
+                link_states.append({"gateway":old["gateway"],"satellite":old["satellite"],"status":status,"elevation_deg":elev,"rate_gbps":rate,"rain_attenuation_db":fade})
+            if link_cache is not None:
+                link_cache[link_key]=([row.copy() for row in active],
+                                      [row.copy() for row in link_states],ideal,actual)
         active_feeders={x["satellite"] for x in active}
-        feeder_left={int(x["satellite"]):float(x["rate_gbps"]) for x in active}
-        gsl_by_feeder={int(x["satellite"]):float(x.get("gsl_distance_km",0)) for x in active}
+        feeder_left,gsl_by_feeder=_feeder_resources(active)
         xyz_cache={}
         def xyz(satellite):
             satellite=int(satellite)
@@ -2335,13 +2415,20 @@ class SlowFastLoopPlanner:
             if extra<=1e-9:continue
             row["demand_gbps"]=round(float(row["demand_gbps"])+extra,6)
             source_left[source]-=extra;feeder_left[feeder]-=extra
+        if self.config.feeder_link_mode=="dual":
+            valid,link_usage=_bind_routes_to_links(valid,active)
+        else:
+            link_usage={}
         reachable=sum(x["demand_gbps"] for x in valid)
         if plan["routes"]:
             demand_by_feeder={}
             for route in valid:
                 feeder=int(route.get("feeder",-1));demand_by_feeder[feeder]=demand_by_feeder.get(feeder,0.)+float(route.get("demand_gbps",0))
             for x in active:
-                x["scheduled_gbps"]=round(min(float(x["rate_gbps"]),demand_by_feeder.get(int(x["satellite"]),0.)),6)
+                key=(int(x["gateway"]),int(x["satellite"]),int(x.get("feeder_port",1)))
+                load=(link_usage.get(key,0.) if self.config.feeder_link_mode=="dual"
+                      else demand_by_feeder.get(int(x["satellite"]),0.))
+                x["scheduled_gbps"]=round(min(float(x["rate_gbps"]),load),6)
                 x["utilization"]=round(x["scheduled_gbps"]/max(x["rate_gbps"],1e-12),6)
             scheduled=min(float(total_demand),sum(float(x["scheduled_gbps"]) for x in active))
         else:
@@ -2405,8 +2492,9 @@ class SlowFastLoopPlanner:
         if any(int(row.get("source",-1)) not in demands for row in plan.get("routes",[])):
             plan=plan.copy();plan["routes"]=[row for row in plan.get("routes",[]) if int(row.get("source",-1)) in demands]
             self.state.execution_plan=plan
+        link_cache={}
         evaluation_started=time.perf_counter()
-        active=self._evaluate(t,plan,pairs,demand,edges,current_source_count,positions,demands);action="按慢环规划执行"
+        active=self._evaluate(t,plan,pairs,demand,edges,current_source_count,positions,demands,link_cache);action="按慢环规划执行"
         initial_evaluation_ms=(time.perf_counter()-evaluation_started)*1000
         active_feeders={int(row["satellite"]) for row in active.get("active_links",[])}
         primary_routes=plan.get("routes",[])[:int(plan.get("primary_route_count",len(plan.get("routes",[]))))]
@@ -2421,8 +2509,8 @@ class SlowFastLoopPlanner:
         demand_changed=(set(demands)!=set(self.state.last_demands) or any(abs(float(value)-float(self.state.last_demands.get(source,0)))>1e-6 for source,value in demands.items()))
         priority_changed=priority_demands!=getattr(self,"_last_priority_demands",{})
         route_capacity_missing=float(active.get("route_capacity_gap_gbps",0))>1e-3
-        current_feeder_capacities={int(row["satellite"]):round(float(row.get("rate_gbps",0)),6)
-                                   for row in active.get("active_links",[])}
+        current_feeder_capacities={satellite:round(rate,6) for satellite,rate in
+                                   _feeder_resources(active.get("active_links",[]))[0].items()}
         lost_active_feeder=bool(set(self.state.last_feeder_capacities)-set(current_feeder_capacities))
         newly_active_feeder=bool(set(current_feeder_capacities)-set(self.state.last_feeder_capacities))
         route_needs_repair=route_broken or bool(new_sources) or demand_changed or priority_changed or route_capacity_missing
@@ -2485,9 +2573,8 @@ class SlowFastLoopPlanner:
                 (gap_worsened or newly_broken or lost_active_feeder or newly_active_feeder)
                 else "周期修补" if self.config.selection_strategy=="slot_tracking" else "局部修补")
             usable_links=list(active.get("active_links",[]))
-            capacities={int(x["satellite"]):float(x["rate_gbps"]) for x in usable_links}
+            capacities,gsl_distances=_feeder_resources(usable_links)
             available={feeder:value for feeder,value in capacities.items() if value>1e-12}
-            gsl_distances={int(x["satellite"]):float(x.get("gsl_distance_km",0)) for x in usable_links}
             source_left=dict(demands);feeder_left=dict(available);retained=[];existing_exits={}
             # Active feeder satellites land their own traffic directly before
             # any retained ISL route can use that feeder's capacity.
@@ -2554,7 +2641,7 @@ class SlowFastLoopPlanner:
             _attach_feeder_delay(plan["routes"],usable_links)
             self.state.execution_plan=plan
             evaluation_started=time.perf_counter()
-            active=self._evaluate(t,plan,pairs,demand,edges,current_source_count,positions,demands)
+            active=self._evaluate(t,plan,pairs,demand,edges,current_source_count,positions,demands,link_cache)
             final_evaluation_ms=(time.perf_counter()-evaluation_started)*1000
             self.state.last_route_update_s=t
             self.state.last_route_sources=set(demands)
@@ -2603,8 +2690,10 @@ class SlowFastLoopPlanner:
         if not due and severe and t-self.state.generated_at_s>=self.config.freeze_window_s:
             self.generate(t,positions,links,gsls,satellite_traffic,priority_traffic=priority_traffic,
                           priority_traffic_regions=priority_traffic_regions);slow_plan=self.state.plans[0];plan=self.state.execution_plan or slow_plan
-            active=self._evaluate(t,plan,pairs,demand,edges,current_source_count,positions,demands);due=True;planning_reason="到达慢规划周期";action="执行慢周期全局重规划"
-        pairs_now={(x["gateway"],x["satellite"]) for x in (active["active_links"] if active else [])}
+            active=self._evaluate(t,plan,pairs,demand,edges,current_source_count,positions,demands,link_cache);due=True;planning_reason="到达慢规划周期";action="执行慢周期全局重规划"
+        pairs_now={(x["gateway"],x["satellite"],x.get("feeder_port",1))
+                   if self.config.feeder_link_mode=="dual" else (x["gateway"],x["satellite"])
+                   for x in (active["active_links"] if active else [])}
         change_count=len(pairs_now.symmetric_difference(self.state.last_scheduled_pairs)) if self.state.last_scheduled_pairs else 0;changed=change_count>0
         if changed:self.state.switch_count+=change_count;self.state.last_switch_s=t
         self.state.last_scheduled_pairs=pairs_now

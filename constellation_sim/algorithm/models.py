@@ -94,4 +94,5 @@ class SimulationConfig:
     planning_selection_strategy: str = "legacy"
     weather_forecast: dict = field(default_factory=dict)
     simulation_start_utc: str = "2000-01-01T00:00:00+00:00"
+    feeder_link_mode: str = "single"  # single or dual; dual permits two links per satellite.
 
