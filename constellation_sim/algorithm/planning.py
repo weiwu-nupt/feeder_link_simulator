@@ -646,20 +646,32 @@ def _repair_routes_local(g,demands,feeder_capacities,feeder_gsl_distances=None,
         found=[];excluded=set(excluded_feeders.get(source,()))
         local_feeders=set((local_feeders_by_source or {}).get(source,set())) & remaining.keys()
         target_count=min(max(12,limit),component_feeder_count[component_ids[source]])
+        # A complete route can end the search once no unseen feeder can have
+        # lower total ISL+GSL delay. This preserves the selected exits while
+        # avoiding twelve-feeder searches for every affected traffic source.
         # Bound retained searches: a full 500-node predecessor map for every
         # traffic source can consume hundreds of MB on a large constellation.
         use_cache=search_cache is not None and ((source,max_visited_per_source) in search_cache or len(search_cache)<256)
         if not use_cache:
+            minimum_gsl_km=(min((float(gsl.get(feeder,0.)) for feeder in remaining
+                if component_ids[feeder]==component_ids[source] and feeder not in excluded),default=0.)
+                if not local_feeders else 0.)
             distances={source:0.};previous={source:-1};queue=[(0.,source)];visited=0
+            best_full_delay_km=math.inf
             while queue and visited<max_visited_per_source and (len(found)<target_count or
                     (local_feeders and not any(feeder in local_feeders for _,feeder in found))):
                 distance,node=heapq.heappop(queue)
                 if distance!=distances.get(node):continue
                 visited+=1
-                if node in feeder_set and node not in excluded and remaining.get(node,0)>1e-9:found.append((distance,node))
+                if node in feeder_set and node not in excluded and remaining.get(node,0)>1e-9:
+                    found.append((distance,node))
+                    if not local_feeders and remaining[node]>=left-1e-9:
+                        best_full_delay_km=min(best_full_delay_km,distance/1000+float(gsl.get(node,0.)))
                 for neighbor,edge_distance in g[node]:
                     candidate=distance+edge_distance
                     if candidate<distances.get(neighbor,math.inf):distances[neighbor]=candidate;previous[neighbor]=node;heapq.heappush(queue,(candidate,neighbor))
+                if best_full_delay_km<math.inf and (not queue or
+                    queue[0][0]/1000+minimum_gsl_km>best_full_delay_km+1e-9):break
         else:
             cache_key=(source,max_visited_per_source)
             cached=search_cache.get(cache_key)
@@ -854,6 +866,13 @@ class SlowFastLoopPlanner:
         station=self.stations[int(gateway)]
         channels=max(0,int(station.get("channel_count",station.get("antenna_count",20))))
         return min(channels,max(0,int(station.get("antenna_count",channels))))
+    def _handover_window(self,old,carried_by_feeder,slot_seconds):
+        normal=max(0.,float(self.config.antenna_switch_window_s))
+        if old is None or carried_by_feeder.get(int(old["satellite"]),0.)>0.01:
+            return normal
+        # An unloaded antenna may spend part of this slot acquiring its next
+        # target. Its physical slew time remains an actual unavailable period.
+        return max(normal,min(30.,max(0.,float(slot_seconds))/2.))
     def _regional_feeders(self,links,plan=None):
         by_satellite={}
         for link in links:by_satellite.setdefault(int(link["satellite"]),[]).append(link)
@@ -1006,7 +1025,8 @@ class SlowFastLoopPlanner:
                     if best_priority_gain>1e-9:
                         near_capacity=[row for row in eligible if row[11]+1e-9>=.95*best_priority_gain]
                         chosen_row=min(near_capacity,key=lambda row:(row[12]/max(row[11],1e-12)-
-                            (2. if candidates[row[5]].get("retained_feeder") else 0.),-row[11],-row[0]))
+                            (.2 if candidates[row[5]].get("retained_feeder") and
+                                candidates[row[5]].get("next_slot_visible") else 0.),-row[11],-row[0]))
                     else:chosen_row=max(eligible,key=lambda row:(row[0],-row[7]))
                 elif self.config.selection_strategy in ("window_margin","slot_tracking") and not capacity_only:
                     margins=[max(0.,float(candidates[row[5]].get("window_mean_rate_gbps") or candidates[row[5]]["rate_gbps"])) for row in eligible]
@@ -1016,10 +1036,14 @@ class SlowFastLoopPlanner:
                     for row,margin,quality in zip(eligible,margins,qualities):
                         margin_norm=(margin-min_margin)/(max_margin-min_margin) if max_margin-min_margin>1e-9 else .5
                         delay_norm=(quality-min_quality)/(max_quality-min_quality) if max_quality-min_quality>1e-9 else .5
-                        # A retained link avoids reacquisition and its service gap.
-                        # Require a material capacity/delay gain before changing it.
+                        # Prefer a feeder that remains usable beyond this slot.
+                        # Continuing a feeder that expires at the next boundary
+                        # must not win solely because it avoids one handover.
                         utility=capacity_weight*margin_norm+delay_weight*delay_norm
-                        if candidates[row[5]].get("retained_feeder"):utility+=.25
+                        if candidates[row[5]].get("next_slot_visible"):utility+=.12
+                        if candidates[row[5]].get("retained_feeder"):
+                            utility+=.12 if candidates[row[5]].get("next_slot_visible") else -.12
+                        if self.config.selection_strategy=="slot_tracking":utility+=.15*row[2]
                         margin_scores[row[5]]=(utility,margin_norm,delay_norm,margin)
                     chosen_row=max(eligible,key=lambda row:(margin_scores[row[5]][0],row[0],-row[7]))
                 elif self.config.selection_strategy=="legacy" and self.config.capacity_weight==0 and self.config.delay_weight==0:
@@ -1140,7 +1164,7 @@ class SlowFastLoopPlanner:
                 selected[replace_index]=candidate
             sat=int(candidate["satellite"]);used[sat]=used.get(sat,0)+1;total+=gain
         return selected,total,total+1e-9>=target
-    def _retain_slot_links(self,chosen,candidates,previous_plan,graph,demands,capacity_target,reference_time_s):
+    def _retain_slot_links(self,chosen,candidates,previous_plan,graph,demands,capacity_target,reference_time_s,next_slot_visible_pairs=None):
         """Start each slot from usable feeders and limit voluntary handovers."""
         if not previous_plan:return chosen
         by_pair={(int(row["gateway"]),int(row["satellite"])):row for row in candidates}
@@ -1150,6 +1174,11 @@ class SlowFastLoopPlanner:
         for row in chosen:selected.setdefault(int(row["gateway"]),[]).append(row)
         nearest=_nearest_demand_distance(graph,demands)
         component_ids=_component_ids(graph)
+        carried_by_feeder={};priority_by_feeder={}
+        for route in previous_plan.get("routes",[]):
+            feeder=int(route.get("feeder",-1));amount=max(0.,float(route.get("demand_gbps",0.)))
+            carried_by_feeder[feeder]=carried_by_feeder.get(feeder,0.)+amount
+            priority_by_feeder[feeder]=priority_by_feeder.get(feeder,0.)+min(amount,max(0.,float(route.get("priority_gbps",0.))))
         def regional(row):
             return any(_surface_distance_km(row.get("latitude_deg",0),row.get("longitude_deg",0),
                 region["lat"],region["lon"])<=float(region["radius_km"])
@@ -1160,12 +1189,21 @@ class SlowFastLoopPlanner:
             prior=previous.get(gateway,[])
             standby_ready=self._standby_available(gateway,previous_plan,reference_time_s)
             current=selected.get(gateway,[])
+            selected_satellites={int(row["satellite"]) for row in current}
             desired_local={}
             for row in current:
                 if regional(row):
                     component=component_ids[int(row["satellite"])]
                     desired_local[component]=min(2,desired_local.get(component,0)+1)
+            # The optimizer has already compared demand, delay, visibility and
+            # continuity. Rebuilding the slot from every visible old feeder
+            # discards that result and creates a strong directional lock-in.
             retained=[]
+            for row in current:
+                satellite=int(row["satellite"])
+                if satellite in used or len(retained)>=quota:continue
+                retained.append(row)
+                used.add(satellite)
             for old in sorted(prior,key=lambda row:float(row.get("rate_gbps",0)),reverse=True):
                 satellite=int(old["satellite"])
                 keep=by_pair.get((gateway,satellite))
@@ -1173,22 +1211,47 @@ class SlowFastLoopPlanner:
                 retained.append(dict(keep,selection_reason="continue tracking"))
                 used.add(satellite)
             additions=[row for row in current if int(row["satellite"]) not in used]
-            additions.sort(key=lambda row:float(row.get("rate_gbps",0)),reverse=True)
+            additions.sort(key=lambda row:(bool(row.get("next_slot_visible")),
+                float(row.get("rate_gbps",0))),reverse=True)
             while additions and len(retained)<quota:
                 row=additions.pop(0)
                 if int(row["satellite"]) in used:continue
                 retained.append(row);used.add(int(row["satellite"]))
-            # An occupied station may proactively change at most 10% of its
-            # antennas per minute. Forced replacements for vanished feeders
-            # have already entered through the vacant positions above.
-            voluntary_budget=max(1,quota//10)
-            if sum(float(row.get("rate_gbps",0)) for row in retained)<min(
-                    .8*sum(float(row.get("rate_gbps",0)) for row in current),
-                    sum(float(v) for v in demands.values())/max(1,len(self.stations))):
-                voluntary_budget=quota
-            voluntary=0
+            # The greedy selector may fill every channel with continuing links.
+            # Still inspect a small set of feasible successors for idle antennas.
+            seen_additions={int(row["satellite"]) for row in additions}
+            successor_pool=[row for row in candidates if int(row["gateway"])==gateway
+                and int(row["satellite"]) not in used and int(row["satellite"]) not in seen_additions]
+            def successor_rank(row):
+                return (bool(row.get("next_slot_visible")),
+                    -(nearest[int(row["satellite"])]/1000+float(row.get("gsl_distance_km",0)))/C_KM_PER_MS,
+                    float(row.get("rate_gbps",0)))
+            successors=[]
+            for sector in range(4):
+                sector_rows=(row for row in successor_pool if int(float(row.get("azimuth_deg",0))%360//90)==sector)
+                successors.extend(sorted(sector_rows,key=successor_rank,reverse=True)[:4])
+            successors.extend(sorted(successor_pool,key=successor_rank,reverse=True)[:8])
+            successors=list({int(row["satellite"]):row for row in successors}.values())
+            additions.extend(successors)
+            # A feeder that cannot cover the following slot must be replaced
+            # before it reaches the current slot's visibility boundary.
+            def direction_sector(row):
+                return int(float(row.get("azimuth_deg", 0.)) % 360. // 90)
+            def sector_load(rows):
+                counts=[0, 0, 0, 0]
+                for item in rows:
+                    counts[direction_sector(item)]+=1
+                return counts
+            # Inspect underrepresented directions first. This only changes
+            # replacement order; feasibility and traffic checks still apply.
+            loads=sector_load(retained)
+            additions.sort(key=lambda row:(loads[direction_sector(row)],
+                not bool(row.get("next_slot_visible")),
+                -float(row.get("rate_gbps", 0.))))
+            expiring={int(row["satellite"]) for row in retained
+                      if next_slot_visible_pairs is not None and
+                      (gateway,int(row["satellite"])) not in next_slot_visible_pairs}
             for new in additions:
-                if voluntary>=voluntary_budget:break
                 if int(new["satellite"]) in used:continue
                 options=[]
                 for index,keep in enumerate(retained):
@@ -1222,19 +1285,59 @@ class SlowFastLoopPlanner:
                         max(_axis_slew_seconds(delta_az,self.config.antenna_az_slew_deg_s,self.config.antenna_az_accel_deg_s2),
                             _axis_slew_seconds(delta_el,self.config.antenna_el_slew_deg_s,self.config.antenna_el_accel_deg_s2))+
                         self.config.antenna_acquisition_s)
-                    if switch_s>self.config.antenna_switch_window_s+1e-9:continue
-                    old_volume=float(keep["rate_gbps"])*60.
-                    new_volume=float(new["rate_gbps"])*max(0.,60.-switch_s)
+                    slot_seconds=float(previous_plan.get("valid_until_s",reference_time_s+60.))-float(previous_plan.get("valid_from_s",reference_time_s))
+                    if switch_s>self._handover_window(old,carried_by_feeder,slot_seconds)+1e-9:continue
+                    old_volume=float(keep["rate_gbps"])*slot_seconds
+                    new_volume=float(new["rate_gbps"])*max(0.,slot_seconds-switch_s)
                     old_delay=(nearest[int(keep["satellite"])]/1000+float(keep.get("gsl_distance_km",0)))/C_KM_PER_MS
-                    new_delay=float(new.get("estimated_weighted_delay_ms",old_delay))
-                    worthwhile=(regional_gap or new_volume>old_volume*1.20 or
-                        (new_delay+3.<old_delay and new_volume>=old_volume*.95) or
+                    # Compare both exits with the same demand-to-feeder metric.
+                    # A selection-stage weighted delay is not comparable with
+                    # the old exit's nearest-demand delay.
+                    new_delay=(nearest[int(new["satellite"])]/1000+
+                        float(new.get("gsl_distance_km",0)))/C_KM_PER_MS
+                    carried=carried_by_feeder.get(int(keep["satellite"]),0.)
+                    priority_carried=priority_by_feeder.get(int(keep["satellite"]),0.)
+                    future_gain=(next_slot_visible_pairs is not None and
+                        (gateway,int(keep["satellite"])) not in next_slot_visible_pairs and
+                        (gateway,int(new["satellite"])) in next_slot_visible_pairs)
+                    early_handover=(int(keep["satellite"]) in expiring and
+                        future_gain and float(new["rate_gbps"])>=carried and
+                        new_volume>=old_volume*.75 and new_delay<=old_delay+(2. if priority_carried>0. else 3.))
+                    idle_reposition=(carried<=0.01 and priority_carried<=1e-6 and bool(new.get("next_slot_visible")) and
+                        float(new["rate_gbps"])>=float(keep["rate_gbps"])*.8 and
+                        (future_gain and new_delay<=old_delay+1. or new_delay+1.<old_delay))
+                    selected_upgrade=(carried<=0.01 and priority_carried<=1e-6 and int(new["satellite"]) in selected_satellites and
+                        bool(new.get("next_slot_visible")) and
+                        float(new["rate_gbps"])>=max(carried,float(keep["rate_gbps"])*.75) and
+                        new_delay<=old_delay+1.5)
+                    others=[row for j,row in enumerate(retained) if j!=index]
+                    old_spread=min((_candidate_angle_deg(keep,row) for row in others),default=180.)
+                    new_spread=min((_candidate_angle_deg(new,row) for row in others),default=180.)
+                    spread_upgrade=(carried<=0.01 and priority_carried<=1e-6 and
+                        bool(new.get("next_slot_visible")) and new_spread>old_spread+20. and
+                        float(new["rate_gbps"])>=float(keep["rate_gbps"])*.8 and
+                        new_delay<=old_delay+1.)
+                    loads=sector_load(retained)
+                    old_sector=direction_sector(keep)
+                    new_sector=direction_sector(new)
+                    direction_upgrade=(carried<=0.01 and priority_carried<=1e-6 and
+                        old_sector!=new_sector and loads[old_sector]>=loads[new_sector]+3 and
+                        bool(new.get("next_slot_visible")) and
+                        float(new["rate_gbps"])>=float(keep["rate_gbps"])*.85 and
+                        new_delay<=old_delay+1.5 and new_volume>=old_volume*.75)
+                    worthwhile=(direction_upgrade or spread_upgrade or selected_upgrade or idle_reposition or early_handover or regional_gap or new_volume>old_volume*1.20 or
+                        (new_delay+(2. if priority_carried>0. else 1.5)<old_delay and
+                         new_volume>=old_volume*.95 and float(new["rate_gbps"])>=carried) or
                         (local_new and not local_old and new_volume>=old_volume*.90))
-                    if worthwhile:options.append((new_volume-old_volume,index,keep))
+                    if worthwhile:options.append((int(early_handover or idle_reposition or selected_upgrade or spread_upgrade or direction_upgrade),
+                        loads[old_sector]-loads[new_sector] if direction_upgrade else
+                        new_spread-old_spread if spread_upgrade else -priority_carried*switch_s,
+                        new_volume-old_volume+carried*(old_delay-new_delay),index,keep))
                 if not options:continue
-                _gain,index,old=max(options,key=lambda item:item[0])
+                _urgent,_priority_loss,_gain,index,old=max(options,key=lambda item:item[:3])
                 used.discard(int(old["satellite"]));retained[index]=new
-                used.add(int(new["satellite"]));voluntary+=1
+                used.add(int(new["satellite"]))
+                expiring.discard(int(old["satellite"]))
             result.extend(retained)
         return result
 
@@ -1265,6 +1368,8 @@ class SlowFastLoopPlanner:
             return (max(0.,priority-spare),max(0.,carried-spare),priority,carried)
         max_angle=max(0.,float(self.config.max_slot_pointing_change_deg))
         switch_window=max(0.,float(self.config.antenna_switch_window_s))
+        slot_seconds=(float(previous_plan.get("valid_until_s",reference_time_s+60.))-
+            float(previous_plan.get("valid_from_s",reference_time_s))) if previous_plan else 60.
         electronic=self.config.antenna_steering_type=="electronic"
         def steering(old,row):
             old_az=float(old.get("azimuth_deg",0));new_az=float(row.get("azimuth_deg",0))
@@ -1319,10 +1424,12 @@ class SlowFastLoopPlanner:
                         angle=math.degrees(math.acos(tracking_dot))
                         delta_az=abs((float(row["azimuth_deg"])-float(old["previous_slot_azimuth_deg"])+180.)%360.-180.)
                         delta_el=abs(float(row["pointing_elevation_deg"])-float(old["previous_slot_elevation_deg"]))
-                    tracking_ok=(delta_az/max(.01,float(self.config.antenna_az_slew_deg_s))<=60.+1e-9 and
-                                 delta_el/max(.01,float(self.config.antenna_el_slew_deg_s))<=60.+1e-9)
+                    slot_seconds=float(previous_plan.get("valid_until_s",reference_time_s+60.))-float(previous_plan.get("valid_from_s",reference_time_s))
+                    tracking_ok=(delta_az/max(.01,float(self.config.antenna_az_slew_deg_s))<=slot_seconds+1e-9 and
+                                 delta_el/max(.01,float(self.config.antenna_el_slew_deg_s))<=slot_seconds+1e-9)
+                    allowed_window=self._handover_window(old,carried_by_feeder,slot_seconds)
                     if (not max_angle or angle<=max_angle+1e-9) and ((not changed and (electronic or tracking_ok)) or
-                                                                   (changed and seconds<=switch_window+1e-9)):
+                                                                   (changed and seconds<=allowed_window+1e-9)):
                         choices.append((0 if int(old["satellite"])==int(row["satellite"])
                                         else 2 if has_spare_antennas else 1,angle,antenna_id,old))
                 options.append(sorted(choices,key=lambda item:(item[0],item[1],item[2])))
@@ -1407,7 +1514,8 @@ class SlowFastLoopPlanner:
                         pointing_reference_time_s=reference_time_s,
                         azimuth_change_deg=round(delta_az,3),elevation_change_deg=round(delta_el,3),
                         estimated_switch_s=round(seconds,3) if changed else None,
-                        switch_window_s=switch_window,switch_feasible=bool(not changed or seconds<=switch_window+1e-9))
+                        switch_window_s=self._handover_window(old,carried_by_feeder,slot_seconds),
+                        switch_feasible=bool(not changed or seconds<=self._handover_window(old,carried_by_feeder,slot_seconds)+1e-9))
                 accepted.append(row)
                 accepted_at_gateway+=1
             if has_spare_antennas and previous_plan:
@@ -1437,7 +1545,7 @@ class SlowFastLoopPlanner:
             "antenna_acquisition_s":self.config.antenna_acquisition_s,
             "electronic_scan_from_zenith_deg":self.config.electronic_scan_from_zenith_deg}
 
-    def generate(self,t,positions,links,gsls,satellite_traffic,rain_scenario_percentile=None,rain_grade=None,commit=True,window_rates=None,priority_traffic=None,priority_traffic_regions=None,previous_plan=None):
+    def generate(self,t,positions,links,gsls,satellite_traffic,rain_scenario_percentile=None,rain_grade=None,commit=True,window_rates=None,priority_traffic=None,priority_traffic_regions=None,previous_plan=None,next_slot_visible_pairs=None):
         selection_started=time.perf_counter()
         candidates=self._candidates(gsls,t,planning=True,rain_scenario_percentile=rain_scenario_percentile,rain_grade=rain_grade,positions=positions,window_rates=window_rates);demands={int(x[0]):float(x[1])*self.config.traffic_landing_ratio for x in satellite_traffic if float(x[1])>0}
         graph_key=(id(positions),id(links),len(positions),len(links)) if not commit else None
@@ -1451,6 +1559,8 @@ class SlowFastLoopPlanner:
             if row is not None:
                 candidate.update(_station_pointing(self.stations[int(candidate["gateway"])],row))
                 candidate["plane"]=int(row[1]);candidate["latitude_deg"]=float(row[2]);candidate["longitude_deg"]=float(row[3])
+            if self.config.selection_strategy=="slot_tracking":
+                candidate["next_slot_visible"]=(int(candidate["gateway"]),int(candidate["satellite"])) in (next_slot_visible_pairs or ())
         if self.config.selection_strategy=="slot_tracking" and previous_plan:
             # Compare both targets at this slot boundary. The stored old
             # pointing belongs to the previous slot start (60 seconds ago).
@@ -1468,12 +1578,24 @@ class SlowFastLoopPlanner:
         if self.config.selection_strategy=="slot_tracking" and previous_plan:
             prior_by_gateway={}
             for row in previous_plan.get("links",[]):prior_by_gateway.setdefault(int(row["gateway"]),[]).append(row)
+            carried_by_feeder={}
+            for route in previous_plan.get("routes",[]):
+                feeder=int(route.get("feeder",-1))
+                carried_by_feeder[feeder]=carried_by_feeder.get(feeder,0.)+max(0.,float(route.get("demand_gbps",0.)))
+            slot_seconds=float(previous_plan.get("valid_until_s",t+60.))-float(previous_plan.get("valid_from_s",t))
             standby_ready_by_gateway={gateway:self._standby_available(gateway,previous_plan,t)
                 for gateway in prior_by_gateway}
             retained_pairs={(int(row["gateway"]),int(row["satellite"]))
                             for row in previous_plan.get("links",[])}
             for candidate in candidates:
                 candidate["retained_feeder"]=(int(candidate["gateway"]),int(candidate["satellite"])) in retained_pairs
+            def direction_counts(rows):
+                counts={"east":0,"west":0,"other":0}
+                for row in rows:
+                    az=float(row.get("azimuth_deg",0.))%360.
+                    counts["east" if 45.<=az<135. else "west" if 225.<=az<315. else "other"]+=1
+                return counts
+            direction_before=direction_counts(candidates)
             limit=max(0.,float(self.config.max_slot_pointing_change_deg))
             filtered=[]
             for candidate in candidates:
@@ -1490,8 +1612,9 @@ class SlowFastLoopPlanner:
                         delta_az=abs((float(candidate.get("azimuth_deg",0))-float(old.get("azimuth_deg",0))+180.)%360.-180.)
                         delta_el=abs(float(candidate.get("pointing_elevation_deg",candidate.get("elevation_deg",0)))-
                                      float(old.get("pointing_elevation_deg",old.get("elevation_deg",0))))
-                        if (delta_az/max(.01,self.config.antenna_az_slew_deg_s)<=60.+1e-9 and
-                            delta_el/max(.01,self.config.antenna_el_slew_deg_s)<=60.+1e-9):filtered.append(candidate);break
+                        slot_seconds=float(previous_plan.get("valid_until_s",t+60.))-float(previous_plan.get("valid_from_s",t))
+                        if (delta_az/max(.01,self.config.antenna_az_slew_deg_s)<=slot_seconds+1e-9 and
+                            delta_el/max(.01,self.config.antenna_el_slew_deg_s)<=slot_seconds+1e-9):filtered.append(candidate);break
                         continue
                     if self.config.antenna_steering_type=="electronic":seconds=max(0.,self.config.electronic_switch_ms)/1000.
                     else:
@@ -1500,8 +1623,12 @@ class SlowFastLoopPlanner:
                                      float(old.get("pointing_elevation_deg",old.get("elevation_deg",0))))
                         seconds=max(_axis_slew_seconds(delta_az,self.config.antenna_az_slew_deg_s,self.config.antenna_az_accel_deg_s2),
                                     _axis_slew_seconds(delta_el,self.config.antenna_el_slew_deg_s,self.config.antenna_el_accel_deg_s2))+self.config.antenna_acquisition_s
-                    if seconds<=self.config.antenna_switch_window_s+1e-9:filtered.append(candidate);break
+                    if seconds<=self._handover_window(old,carried_by_feeder,slot_seconds)+1e-9:
+                        filtered.append(candidate);break
             candidates=filtered
+            direction_after=direction_counts(candidates)
+        else:
+            direction_before=direction_after=None
         priority_demands={source:min(demand,max(0.,float((priority_traffic or {}).get(source,0.))*self.config.traffic_landing_ratio))
                           for source,demand in demands.items() if float((priority_traffic or {}).get(source,0.))>0.}
         for source in priority_demands:
@@ -1557,11 +1684,16 @@ class SlowFastLoopPlanner:
                         chosen[min(removable,key=lambda index:float(chosen[index].get("rate_gbps",0)))]=item
             selected_capacity=sum(float(item.get("rate_gbps",0)) for item in chosen)
             target_satisfied=selected_capacity+1e-9>=capacity_target
+        selected_before_retention=(direction_counts(chosen) if direction_before is not None else None)
+        selected_after_retention=None
+        selected_after_primary_match=None
         handover={}
         if self.config.selection_strategy=="slot_tracking":
             if self.config.feeder_link_mode!="dual":
-                chosen=self._retain_slot_links(chosen,candidates,previous_plan,g,demands,capacity_target,t)
+                chosen=self._retain_slot_links(chosen,candidates,previous_plan,g,demands,capacity_target,t,next_slot_visible_pairs)
+            selected_after_retention=(direction_counts(chosen) if direction_before is not None else None)
             primary,handover=self._assign_slot_antennas(chosen,previous_plan,t,graph=g)
+            selected_after_primary_match=(direction_counts(primary) if direction_before is not None else None)
             # Give the antenna matcher fallback satellites before it drops an
             # infeasible first choice and leaves an otherwise usable antenna idle.
             selected_satellites={int(row["satellite"]) for row in primary}
@@ -1573,7 +1705,7 @@ class SlowFastLoopPlanner:
             fallback=[]
             for gateway,alternatives in alternatives_by_gateway.items():
                 alternatives.sort(key=lambda row:float(row.get("rate_gbps",0)),reverse=True)
-                for candidate in alternatives[:3*self._gateway_limit(gateway)]:
+                for candidate in alternatives:
                     satellite=int(candidate["satellite"])
                     if satellite not in selected_satellites:
                         fallback.append(candidate);selected_satellites.add(satellite)
@@ -2108,6 +2240,13 @@ class SlowFastLoopPlanner:
           "average_hops":avg,"business_weighted_hops":bweighted,"business_propagation_delay_ms":delay,
           "p95_propagation_delay_ms":p95_delay,"maximum_propagation_delay_ms":max_delay,"latency_scope":"服务卫星至信关站（ISL+馈电GSL）","station_usage":usage}
         plan.update(handover)
+        if direction_before is not None:
+            plan["candidate_direction_diagnostics"]={"before_switch_filter":direction_before,
+                "after_switch_filter":direction_after,
+                "optimizer_selected":selected_before_retention,
+                "after_retention":selected_after_retention,
+                "after_primary_match":selected_after_primary_match,
+                "selected":direction_counts(chosen)}
         plan.update(capacity_weight=round(self.config.capacity_weight,6),delay_weight=round(self.config.delay_weight,6),
                     adaptive_candidate_k=int(getattr(self,"_last_candidate_k",0)),delay_reference_ms=round(self.config.delay_reference_ms,6),
                     selection_method="有界多源最短路 + 容量时延双目标边际优化",
@@ -2124,7 +2263,7 @@ class SlowFastLoopPlanner:
             plan["objective_formula"]="wc*normalized(window_mean_rate)+wd*normalized(path_delay_quality); minimum-rate capacity target repair"
         elif self.config.selection_strategy=="slot_tracking":
             plan["selection_method"]="five-minute rolling plan with 60-second link review, retained feeders and hard-handover outage"
-            plan["objective_formula"]="capacity and delay utility; replace a retained feeder only when slot volume or delay gain exceeds switch outage cost"
+            plan["objective_formula"]="capacity and delay utility with next-slot visibility; retained feeders compete with feasible successors"
             plan["rain_field"]=self.config.rain_field
         elif self.config.capacity_weight==0 and self.config.delay_weight==0:
             plan["selection_method"]="capacity feasibility, then shortest feasible path"
@@ -2166,21 +2305,27 @@ class SlowFastLoopPlanner:
         carrying_feeders={int(row.get("feeder",-1)) for row in (previous or {}).get("routes",[])
                           if float(row.get("demand_gbps",0))>1e-9}
         changes_by_gateway={}
-        idle_starts={}
         for row in plan.get("links",[]):
             antenna=row.get("antenna_id");gateway=int(row["gateway"])
             old=previous_by_antenna.get((gateway,int(antenna))) if antenna is not None else None
             if old is not None and int(old["satellite"])!=int(row["satellite"]):
-                if int(old["satellite"]) in carrying_feeders:changes_by_gateway.setdefault(gateway,[]).append(row)
-                else:idle_starts[(gateway,int(row["antenna_id"]))]=slot_start
-        starts=standby_starts | idle_starts
+                if row.get("handover_from_antenna_id") is None:
+                    changes_by_gateway.setdefault(gateway,[]).append(row)
+        starts=dict(standby_starts)
+        visibility_deadlines=plan.get("old_feeder_visibility_deadline_s") or {}
         for gateway,rows in changes_by_gateway.items():
-            rows.sort(key=lambda row:int(row["antenna_id"]))
+            rows.sort(key=lambda row:(
+                float(visibility_deadlines.get(f'{gateway}:{int(row["antenna_id"])}',slot_end)),
+                int(previous_by_antenna[(gateway,int(row["antenna_id"]))]["satellite"]) in carrying_feeders,
+                int(row["antenna_id"])))
             longest=max(float(row.get("estimated_switch_s") or 0.) for row in rows)
             span=max(0.,slot_end-slot_start-longest)
             for index,row in enumerate(rows):
-                offset=span*index/max(1,len(rows)-1) if len(rows)>1 else 0.
-                starts[(gateway,int(row["antenna_id"]))]=slot_start+offset
+                antenna=int(row["antenna_id"])
+                deadline=float(visibility_deadlines.get(f'{gateway}:{antenna}',slot_end))
+                duration=float(row.get("estimated_switch_s") or 0.)
+                preferred=slot_start+span*index/max(1,len(rows)-1) if len(rows)>1 else slot_start
+                starts[(gateway,antenna)]=max(slot_start,min(preferred,deadline-duration,slot_end-duration))
         return starts
 
     def prepare_transition_routes(self,plan,previous,positions,links,priority_traffic_regions=None):
@@ -2216,8 +2361,11 @@ class SlowFastLoopPlanner:
                 elif begin<start+float(row.get("estimated_switch_s") or 0.) and (
                     old:=previous_by_antenna.get((gateway,int(row["handover_from_antenna_id"]))
                         if row.get("handover_from_antenna_id") is not None else key)) is not None:
-                    usable[(gateway,int(old.get("antenna_id",-1)),int(old["satellite"]))]=old
-                    waiting_old_feeders.add(int(old["satellite"]))
+                    deadline=float((plan.get("old_feeder_visibility_deadline_s") or {}).get(
+                        f'{gateway}:{int(old.get("antenna_id",-1))}',slot_end))
+                    if end<=deadline+1e-9:
+                        usable[(gateway,int(old.get("antenna_id",-1)),int(old["satellite"]))]=old
+                        waiting_old_feeders.add(int(old["satellite"]))
             capacities,gsl=_feeder_resources(usable.values())
             local={}
             for region_name,region_loads in (priority_traffic_regions or {}).items():
@@ -2290,7 +2438,9 @@ class SlowFastLoopPlanner:
                 old_key=(gateway,int(new["handover_from_antenna_id"])) if new.get("handover_from_antenna_id") is not None else key
                 if old_key in previous_by_antenna:
                     old=dict(previous_by_antenna[old_key])
-                    old["temporary_until_s"]=until if new.get("handover_from_antenna_id") is not None else switch_start
+                    old_deadline=float((plan.get("old_feeder_visibility_deadline_s") or {}).get(
+                        f'{old_key[0]}:{old_key[1]}',slot_end))
+                    old["temporary_until_s"]=min(old_deadline,until if new.get("handover_from_antenna_id") is not None else switch_start)
                     if new.get("handover_from_antenna_id") is not None:
                         old["standby_transfer_start_s"]=switch_start
                         old["standby_transfer_duration_s"]=float(new.get("estimated_switch_s") or 0.)
@@ -2344,13 +2494,13 @@ class SlowFastLoopPlanner:
                 if t+1e-9<unavailable_until:
                     switch_start=old.get("scheduled_switch_start_s")
                     waiting=switch_start is not None and t+1e-9<float(switch_start)
-                    link_states.append({"gateway":old["gateway"],"satellite":old["satellite"],
+                    link_states.append({"gateway":old["gateway"],"satellite":old["satellite"],"feeder_port":old.get("feeder_port",1),
                         "status":"等待切换" if waiting else "备用天线信道转接中" if old.get("handover_from_antenna_id") is not None else "切星捕获中","rate_gbps":0.,
                         "scheduled_switch_start_s":switch_start,"unavailable_until_s":round(unavailable_until,3)})
                     continue
                 elev=pairs.get((old["gateway"],old["satellite"]))
                 if elev is None:
-                    link_states.append({"gateway":old["gateway"],"satellite":old["satellite"],"status":"不可见","rate_gbps":0.})
+                    link_states.append({"gateway":old["gateway"],"satellite":old["satellite"],"feeder_port":old.get("feeder_port",1),"status":"不可见","rate_gbps":0.})
                     continue
                 grade=plan.get("rain_grade") if plan.get("offline") and self.config.rain_enabled else None
                 rain=({"rain_rate_mmh":0.,"actual_attenuation_db":0.,"severity":grade or "中雨"} if self.config.rain_field=="synthetic_field" else
@@ -2370,26 +2520,35 @@ class SlowFastLoopPlanner:
                     transfer_s=max(0.,float(old.get("standby_transfer_duration_s",0.)))
                     rate*=1.-min(1.,transfer_s/frame_s)
                 if rate<=0:
-                    link_states.append({"gateway":old["gateway"],"satellite":old["satellite"],"status":"容量为零","elevation_deg":elev,"rate_gbps":0.,"rain_attenuation_db":fade})
+                    link_states.append({"gateway":old["gateway"],"satellite":old["satellite"],"feeder_port":old.get("feeder_port",1),"status":"容量为零","elevation_deg":elev,"rate_gbps":0.,"rain_attenuation_db":fade})
                     continue
                 x=old.copy();x.update(elevation_deg=elev,snr_db=snr,modcod=mcs,rate_gbps=rate,gso_interference_db=round(gso_interference_penalty_db(self.config),3),rain_attenuation_db=fade,rain_actual_db=(fade if self.config.rain_field=="synthetic_field" or grade else rain["actual_attenuation_db"]),rain_rate_mmh=(forecast_rain_rate_mmh(self.stations[int(old["gateway"])],t) if grade and self.config.rain_field=="forecast" else synthetic_surface_rain_rate_mmh(self.stations[int(old["gateway"])],grade or "中雨",t) if self.config.rain_enabled and self.config.rain_field=="synthetic_field" else rain["rain_rate_mmh"]),rain_severity=(self.stations[int(old["gateway"])].get("rain_grade") or grade or rain["severity"]))
                 if positions is not None:x["gsl_distance_km"]=_gsl_distance_km(positions[int(old["satellite"])][4],elev)
                 active.append(x);actual+=rate
                 status="容量下降" if rate<float(old.get("rate_gbps",0))*self.config.capacity_threshold_ratio else "可用"
-                link_states.append({"gateway":old["gateway"],"satellite":old["satellite"],"status":status,"elevation_deg":elev,"rate_gbps":rate,"rain_attenuation_db":fade})
+                link_states.append({"gateway":old["gateway"],"satellite":old["satellite"],"feeder_port":old.get("feeder_port",1),"status":status,"elevation_deg":elev,"rate_gbps":rate,"rain_attenuation_db":fade})
             if link_cache is not None:
                 link_cache[link_key]=([row.copy() for row in active],
                                       [row.copy() for row in link_states],ideal,actual)
         active_feeders={x["satellite"] for x in active}
         feeder_left,gsl_by_feeder=_feeder_resources(active)
-        xyz_cache={}
+        xyz_cache=link_cache.setdefault("xyz_cache",{}) if link_cache is not None else {}
+        path_geometry=link_cache.setdefault("path_geometry",{}) if link_cache is not None else {}
+        edge_distance=link_cache.setdefault("edge_distance",{}) if link_cache is not None else {}
         def xyz(satellite):
             satellite=int(satellite)
             if satellite not in xyz_cache:
                 row=positions[satellite];xyz_cache[satellite]=_spherical_ecef(row[2],row[3],row[4])
             return xyz_cache[satellite]
+        def edge_m(a,b):
+            key=(min(a,b),max(a,b))
+            distance=edge_distance.get(key)
+            if distance is None:
+                distance=math.dist(xyz(a),xyz(b))
+                edge_distance[key]=distance
+            return distance
         valid=[];source_left=dict(demand_by_source or {})
-        for route in sorted(plan["routes"],key=lambda row:(bool(row.get("handover_hold",False)),float(row.get("priority_gbps",0))),reverse=True):
+        for route in sorted(plan["routes"],key=lambda row:(bool(row.get("handover_hold",False)),float(row.get("priority_gbps",0)),int(row.get("route_continuity_rank",0))),reverse=True):
             feeder=int(route.get("feeder",-1))
             if feeder not in active_feeders or not all((min(a,b),max(a,b)) in edges for a,b in zip(route["path"],route["path"][1:])):continue
             source=int(route.get("source",-1))
@@ -2399,8 +2558,13 @@ class SlowFastLoopPlanner:
             if "priority_gbps" in row:row["priority_gbps"]=round(min(amount,float(row["priority_gbps"])),6)
             if positions is not None:
                 path=row.get("path",[])
-                isl_km=sum(math.dist(xyz(a),xyz(b)) for a,b in zip(path,path[1:]))/1000
-                gsl_km=gsl_by_feeder.get(feeder,0.)
+                geometry_key=(link_key,feeder,tuple(path))
+                geometry=path_geometry.get(geometry_key)
+                if geometry is None:
+                    isl_km=sum(edge_m(a,b) for a,b in zip(path,path[1:]))/1000
+                    gsl_km=gsl_by_feeder.get(feeder,0.)
+                    path_geometry[geometry_key]=(isl_km,gsl_km)
+                else:isl_km,gsl_km=geometry
                 row.update(distance_km=round(isl_km,3),isl_propagation_delay_ms=round(isl_km/C_KM_PER_MS,4),
                            gsl_distance_km=round(gsl_km,3),gsl_propagation_delay_ms=round(gsl_km/C_KM_PER_MS,4),
                            propagation_delay_ms=round((isl_km+gsl_km)/C_KM_PER_MS,4))
@@ -2440,8 +2604,13 @@ class SlowFastLoopPlanner:
         routed_sources={int(x.get("source",-1)) for x in valid};denominator=int(current_traffic_satellite_count if current_traffic_satellite_count is not None else plan.get("traffic_satellite_count",0))
         theoretical_deliverable=min(float(total_demand),actual)
         if scheduled+1e-3<theoretical_deliverable and demand_by_source and positions is not None:
+            bound_key=("component_bound",link_key)
+            component_bound=link_cache.get(bound_key) if link_cache is not None else None
+            if component_bound is None:
+                component_bound=_component_delivery_bound(len(positions),edges,demand_by_source,active)
+                if link_cache is not None:link_cache[bound_key]=component_bound
             theoretical_deliverable=min(theoretical_deliverable,
-                _component_delivery_bound(len(positions),edges,demand_by_source,active))
+                component_bound)
         route_capacity_gap=max(0.,theoretical_deliverable-scheduled)
         route_satisfaction=1.0 if theoretical_deliverable<=1e-12 else min(1.,scheduled/theoretical_deliverable)
         return {"id":plan["id"],"name":plan["name"],"ideal_capacity_gbps":round(ideal,6),"actual_capacity_gbps":round(actual,6),
@@ -2458,6 +2627,7 @@ class SlowFastLoopPlanner:
     def update(self,t,positions,links,gsls,satellite_traffic,priority_traffic=None,priority_traffic_regions=None):
         update_started=time.perf_counter();route_rebuild_ms=0.;adjustment_ms=0.;route_rebuild_mode="无"
         initial_evaluation_ms=0.;final_evaluation_ms=0.;route_search_ms=0.
+        graph_build_ms=0.;local_route_search_ms=0.;repair_source_count=0
         first_plan=not self.state.plans
         if self.config.offline_mode and first_plan:
             raise RuntimeError("尚未加载离线规划方案，请先执行离线规划")
@@ -2482,11 +2652,54 @@ class SlowFastLoopPlanner:
                 phase_changed=True
                 planned_priority={int(source):float(amount) for source,amount in
                     slow_plan.get("priority_demands_by_satellite_gbps",{}).items()}
-                prepared=[dict(row,priority_gbps=round(min(float(row.get("demand_gbps",0)),
-                    planned_priority.get(int(row.get("source",-1)),0.)),6)) for row in phases[phase]["routes"]]
-                fallback=list(slow_plan.get("routes",[]))+list(slow_plan.get("transition_fallback_routes",[]))
-                plan=plan.copy();plan["routes"]=prepared+fallback
-                plan["primary_route_count"]=len(prepared)
+                # Preserve paths repaired during the previous phase if their
+                # feeder and every ISL edge are still usable in this frame.
+                # The prepared phase routes then act as successors, rather
+                # than resetting all sources to a stale slot snapshot.
+                usable_feeders={int(row["satellite"]) for row in plan.get("links",[])
+                    if (int(row["gateway"]),int(row["satellite"])) in pairs
+                    and t+1e-9<float(row.get("temporary_until_s",math.inf))
+                    and t+1e-9>=self.state.switch_unavailable_until.get(
+                        (int(row["gateway"]),int(row["satellite"]),int(row.get("feeder_port",1))),0.)}
+                retained=[];seen=set()
+                for row in plan.get("routes",[])[:int(plan.get("primary_route_count",len(plan.get("routes",[]))))]:
+                    source=int(row.get("source",-1));feeder=int(row.get("feeder",-1))
+                    path=row.get("path",[])
+                    if source not in demands or feeder not in usable_feeders or not all(
+                        (min(a,b),max(a,b)) in edges for a,b in zip(path,path[1:])):continue
+                    key=(source,feeder,tuple(path))
+                    if key in seen:continue
+                    seen.add(key)
+                    retained.append(dict(row,route_continuity_rank=2))
+                retained_amount={};retained_expires=set()
+                phase_end=min(float(slow_plan.get("valid_until_s",t+5.)),t+5.)
+                feeder_expiry={}
+                for link in plan.get("links",[]):
+                    feeder=int(link["satellite"])
+                    feeder_expiry[feeder]=max(feeder_expiry.get(feeder,0.),
+                        float(link.get("temporary_until_s",math.inf)))
+                for row in retained:
+                    source=int(row["source"])
+                    retained_amount[source]=retained_amount.get(source,0.)+float(row.get("demand_gbps",0.))
+                    if feeder_expiry.get(int(row["feeder"]),0.)<=phase_end+1e-9:
+                        retained_expires.add(source)
+                prepared=[]
+                for row in phases[phase]["routes"]:
+                    source=int(row.get("source",-1));feeder=int(row.get("feeder",-1))
+                    if source not in demands:continue
+                    if retained_amount.get(source,0.)>=demands[source]-1e-6 and source not in retained_expires:
+                        continue
+                    key=(source,feeder,tuple(row.get("path",[])))
+                    if key in seen:continue
+                    seen.add(key)
+                    prepared.append(dict(row,priority_gbps=round(min(float(row.get("demand_gbps",0)),
+                        planned_priority.get(source,0.)),6),route_continuity_rank=1))
+                primary=retained+prepared
+                covered={int(row["source"]) for row in primary}
+                fallback=[row for row in slow_plan.get("routes",[])+slow_plan.get("transition_fallback_routes",[])
+                    if int(row.get("source",-1)) in demands and int(row.get("source",-1)) not in covered]
+                plan=plan.copy();plan["routes"]=primary+fallback
+                plan["primary_route_count"]=len(primary)
                 self.state.execution_plan=plan
                 self.state.last_transition_phase=phase
         if any(int(row.get("source",-1)) not in demands for row in plan.get("routes",[])):
@@ -2604,6 +2817,7 @@ class SlowFastLoopPlanner:
                 row["demand_gbps"]=round(float(row["demand_gbps"])+increment,6)
                 source_left[source]-=increment;feeder_left[feeder]-=increment
             repair_demands={source:amount for source,amount in source_left.items() if amount>1e-6}
+            repair_source_count=len(repair_demands)
             search_capacities={feeder:amount for feeder,amount in feeder_left.items() if amount>1e-6}
             region_geometry={str(row.get("name")):row for row in self.config.priority_task_regions}
             regional_feeders=self._regional_feeders(active.get("active_links",[]),plan)
@@ -2618,6 +2832,7 @@ class SlowFastLoopPlanner:
             if repair_demands and search_capacities:
                 graph=_graph(positions,links)
                 components=_component_ids(graph)
+                graph_build_ms=(time.perf_counter()-search_started)*1000
                 feeder_components={components[feeder] for feeder in search_capacities}
                 repair_demands={source:amount for source,amount in repair_demands.items()
                                 if components[source] in feeder_components}
@@ -2629,6 +2844,7 @@ class SlowFastLoopPlanner:
                     component_ids=components)
             else:repaired=[]
             route_search_ms=(time.perf_counter()-search_started)*1000
+            local_route_search_ms=max(0.,route_search_ms-graph_build_ms)
             new_routes=_compact_routes(retained+repaired,demands,self.config.realtime_exit_limit_per_source)
             if self.config.selection_strategy=="slot_tracking" and priority_demands and local_feeders_by_source:
                 if graph is None:graph=_graph(positions,links)
@@ -2803,6 +3019,9 @@ class SlowFastLoopPlanner:
           "initial_evaluation_ms":round(initial_evaluation_ms,3),
           "final_evaluation_ms":round(final_evaluation_ms,3),
           "route_search_ms":round(route_search_ms,3),
+          "graph_build_ms":round(graph_build_ms,3),
+          "local_route_search_ms":round(local_route_search_ms,3),
+          "repair_source_count":repair_source_count,
           "feeder_adjustment_ms":round(adjustment_ms,3),
           "source_exit_hold_s":round(self.config.source_exit_hold_s,3),
           "planner_update_ms":round((time.perf_counter()-update_started)*1000,3)}

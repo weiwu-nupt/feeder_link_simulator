@@ -30,6 +30,10 @@
 .object-info .info-row.link-warning{background:#4b2815;border-left:3px solid #ff9f1c}.object-info .info-row.link-warning span,.object-info .info-row.link-warning b{color:#ffce8a}
 .object-info .info-section{font-size:12px;padding:3px 5px;margin:7px 0 2px}
 .traffic-summary:not(#planningSummary){font-size:12px!important;width:300px!important}
+.legend.collapsed{width:auto!important;max-height:none!important;overflow:visible!important;padding:6px 8px!important}
+.legend.collapsed>*:not(.legend-toggle){display:none!important}
+.legend-toggle{display:block;width:100%;border:1px solid #2683a3;border-radius:3px;background:#092638;color:#bfeeff;padding:3px 9px;cursor:pointer;font:11px Microsoft YaHei}
+.legend-toggle:hover{background:#0b5872;color:#fff}
 </style></head>
 <body><div id="map"></div><div class="page-tabs"><button id="topologyPage" class="active" data-page="topology">&#25299;&#25169;&#20223;&#30495;</button><button id="businessPage" data-page="business">&#19994;&#21153;&#20998;&#24067;</button><button id="planningPage" data-page="planning">&#35268;&#21010;&#35843;&#24230;</button></div><div id="hud" class="hud">等待仿真数据</div><div class="legend"><select id="viewTheme" style="display:none"><option value="topology" selected>topology</option><option value="business">business</option><option value="planning">planning</option></select><div class="layer-grid"><label><input type="checkbox" data-layer="same" checked><i class="sw" style="background:#ff9f1c"></i>同轨 ISL</label><label><input type="checkbox" data-layer="cross" checked><i class="sw" style="background:#ff4dff"></i>异轨 ISL</label><label><input type="checkbox" data-layer="gsl" checked><i class="sw" style="background:#55d9a7"></i>GSL</label><label><input type="checkbox" data-layer="motion" checked><i class="sw" style="background:linear-gradient(90deg,#00e5ff 50%,#ff5a4f 50%)"></i>方向</label><label><input type="checkbox" data-layer="traffic" checked><i class="sw" style="background:#ff3b30"></i>业务热力</label><label><input type="checkbox" data-layer="serviceAreas" checked><i class="sw" style="background:linear-gradient(90deg,#6fcf97,#56ccf2,#bb6bd9)"></i>业务服务区</label><label><input type="checkbox" data-layer="trafficRegions" checked><i class="sw" style="background:#ffb347"></i>业务小区</label><label><input type="checkbox" data-layer="trafficLinks" checked><i class="sw" style="background:linear-gradient(90deg,#ff4d6d,#ffd166,#4da6ff)"></i>实际接入</label><label><input type="checkbox" data-layer="seam" checked><i class="sw" style="background:#ff3030"></i>轨道缝隙</label><label><input type="checkbox" data-layer="latitude" checked><i class="sw" style="background:#ffe95c"></i>纬度门限</label></div><div id="coverageStatus" style="display:none;margin:6px 0;padding:6px;border:1px solid #28647d;color:#8eeeff;background:#071d2a">等待业务数据</div><div class="map-filter"><span>查看内容</span><select id="inputViewMode"><option value="topology">拓扑态势</option><option value="business">业务分布</option></select><span id="sceneModeLabel">拓扑视图</span><select id="topologySceneMode"><option value="2d">2D平面</option><option value="3d" selected>3D地球</option></select><span>中心轨道</span><select id="planeCenter"></select><span>显示范围</span><select id="planeRange"><option value="3">邻近3面</option><option value="5">邻近5面</option><option value="0" selected>全部</option></select><span>服务卫星</span><select id="serviceSatellite"><option value="">全部卫星</option></select></div><div id="planningFilter" style="display:none;padding-top:7px"><div id="shellLegend"></div>
 <div class="info-section">图例</div>
@@ -41,11 +45,17 @@
 <div class="legend-row"><i class="sw" style="background:#ffd34d"></i>不足 1 Gb/s</div>
 <div class="legend-row"><i class="sw" style="background:#ff5b68"></i>已满</div>
 <div class="legend-row"><i class="sw" style="background:#9aa9b4"></i>不可用</div>
-<div class="legend-row">双馈：直线叠加，粗实线 P1、细虚线 P2</div>
+<div class="legend-row" id="dualFeederLegend">双馈：直线叠加，粗实线 P1、细虚线 P2</div>
 <label class="legend-row"><input type="checkbox" data-layer="planRoutes"><i class="sw" style="background:#4ebaff"></i>规划ISL路径</label>
 <label class="legend-row"><input type="checkbox" data-layer="scheduleRoutes" checked><i class="sw" style="background:#b98cff"></i>实际ISL路径</label>
 </div></div><div id="situation" class="situation" style="display:none"></div><div id="trafficSummary" class="traffic-summary" style="display:none"></div><div id="planningSummary" class="traffic-summary collapsed" style="display:none"></div><div id="objectInfo" class="object-info"></div>
 <script>
+const legendPanel=document.querySelector('.legend');
+const legendToggle=document.createElement('button');legendToggle.type='button';legendToggle.className='legend-toggle';
+legendPanel.prepend(legendToggle);
+function setLegendCollapsed(collapsed){legendPanel.classList.toggle('collapsed',collapsed);legendToggle.textContent=collapsed?'图例 ▾':'图例 ▴';legendToggle.setAttribute('aria-expanded',String(!collapsed))}
+legendToggle.addEventListener('click',()=>setLegendCollapsed(!legendPanel.classList.contains('collapsed')));
+setLegendCollapsed(true);
 const viewer=new Cesium.Viewer('map',{animation:false,timeline:false,geocoder:false,homeButton:false,sceneModePicker:false,navigationHelpButton:false,fullscreenButton:false,baseLayerPicker:false,infoBox:false,selectionIndicator:false,requestRenderMode:true,maximumRenderTimeChange:Infinity,terrainProvider:new Cesium.EllipsoidTerrainProvider(),baseLayer:false});viewer.scene.globe.baseColor=Cesium.Color.fromCssColorString('#15344a');viewer.scene.globe.enableLighting=false;viewer.camera.setView({destination:Cesium.Cartesian3.fromDegrees(105,28,23000000),orientation:{heading:0,pitch:-Cesium.Math.PI_OVER_TWO,roll:0}});
 Cesium.TileMapServiceImageryProvider.fromUrl(Cesium.buildModuleUrl('Assets/Textures/NaturalEarthII')).then(provider=>{viewer.imageryLayers.addImageryProvider(provider);viewer.scene.requestRender()}).catch(error=>{console.warn('Natural Earth imagery unavailable; using the colored globe.',error);viewer.scene.requestRender()});
 const svgUri=svg=>'data:image/svg+xml;charset=utf-8,'+encodeURIComponent(svg),satelliteIcon=svgUri("<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 32 32'><g stroke='#07131d' stroke-width='2' stroke-linejoin='round'><path fill='white' d='M11 11h10v10H11z'/><path fill='white' d='M2 8h8v16H2zM22 8h8v16h-8z'/><path fill='white' d='M14 4h4v7h-4zM14 21h4v7h-4z'/></g></svg>"),stationIcon=svgUri("<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 32 32'><g stroke='#07131d' stroke-width='2.2' stroke-linecap='round' stroke-linejoin='round'><path fill='#70ffd1' d='M5 5a18 18 0 0 0 18 18L5 5z'/><path fill='none' stroke='#70ffd1' d='M18 5a9 9 0 0 1 9 9M20 1a13 13 0 0 1 11 11'/><path fill='none' stroke='white' d='M17 20l-6 9M8 29h13'/><circle fill='#ffe85c' cx='17' cy='17' r='3'/></g></svg>");
@@ -222,11 +232,10 @@ function reconcileSatelliteBusiness(detail){
   ];
   const planning=current?.meta?.planning||{},plan=planning.active_plan||planning.plans?.[0]||{},evaluation=planning.active_evaluation||{};
   const plannedHere=(plan.links||[]).filter(link=>Number(link.satellite)===Number(detail.source));
-  const activePairs=new Set((evaluation.active_links||[]).map(link=>`${link.gateway}:${link.satellite}`));
-  const activeByPair=new Map((evaluation.active_links||[]).map(link=>[`${link.gateway}:${link.satellite}`,link]));
-  const stateByPair=new Map((evaluation.link_states||[]).map(link=>[`${link.gateway}:${link.satellite}`,link]));
+  const activePairs=new Set((evaluation.active_links||[]).map(link=>`${link.gateway}:${link.satellite}:P${Number(link.feeder_port||1)}`));
+  const stateByPair=new Map((evaluation.link_states||[]).map(link=>[`${link.gateway}:${link.satellite}:P${Number(link.feeder_port||1)}`,link]));
   for(const link of plannedHere){
-    const key=`${link.gateway}:${link.satellite}`;
+    const key=`${link.gateway}:${link.satellite}:P${Number(link.feeder_port||1)}`;
     if(activePairs.has(key))continue;
     const state=stateByPair.get(key),status=String(state?.status||'未返回链路状态');
     const start=state?.scheduled_switch_start_s==null?null:Number(state.scheduled_switch_start_s);
@@ -236,7 +245,9 @@ function reconcileSatelliteBusiness(detail){
       :Number.isFinite(until)?`；预计 t=${until.toFixed(1)}s 完成后复核`:'';
     if(status==='等待切换'&&link.previous_satellite!=null){
       const oldSatellite=Number(link.previous_satellite);
-      const old=activeByPair.get(`${link.gateway}:${oldSatellite}`);
+      const oldAntenna=Number(link.handover_from_antenna_id??link.antenna_id);
+      const old=(evaluation.active_links||[]).find(row=>Number(row.gateway)===Number(link.gateway)
+        &&Number(row.satellite)===oldSatellite&&Number(row.antenna_id)===oldAntenna);
       const oldState=old?`旧馈电星 ${satCode(oldSatellite)} 仍在馈电（已用 ${businessAmount(old.scheduled_gbps||0)}）`:
         `旧馈电星 ${satCode(oldSatellite)} 当前未形成有效链路`;
       rows.push([old?'切星等待':'⚠ 旧馈电链路异常',`${oldState}；新目标 ${satCode(Number(link.satellite))} 尚未接入${timing}`]);
@@ -316,15 +327,21 @@ function gatewayAvailability(planning,gid){
   const status=active.length?'available':planned.length?'unavailable':'unassigned';
   return {planned,active,status,reason};
 }
+const planLineStyleByKey=new Map(),feederMaterialCache=new Map(),feederHealthByKey=new Map();
 function renderPlanning(pos){
   const box=document.getElementById('planningSummary'),mode=document.getElementById('viewTheme').value;
+  document.getElementById('dualFeederLegend').style.display=(cfg?.feeder_link_mode||viewedPlanningPlan()?.feeder_link_mode)==='dual'?'block':'none';
   for(const entity of priorityRegionEntities)entity.show=true;
   const activeLineKeys=new Set(),activePointKeys=new Set();
-  const putLine=(key,options)=>{activeLineKeys.add(key);let item=planLineByKey.get(key);if(!item){item=planLines.add(options);planLineByKey.set(key,item)}else{item.positions=options.positions;item.width=options.width;item.material=options.material;if(!item.show)item.show=true}};
+  const putLine=(key,options)=>{activeLineKeys.add(key);let item=planLineByKey.get(key);if(!item){item=planLines.add(options);planLineByKey.set(key,item)}else{item.positions=options.positions;item.width=options.width;if(!options.styleKey||planLineStyleByKey.get(key)!==options.styleKey)item.material=options.material;if(!item.show)item.show=true}if(options.styleKey)planLineStyleByKey.set(key,options.styleKey)};
   const putPoint=(key,options)=>{activePointKeys.add(key);let item=planningPointByKey.get(key);if(!item){item=planningPoints.add(options);planningPointByKey.set(key,item)}else{item.position=options.position;item.pixelSize=options.pixelSize;item.color=options.color;item.outlineColor=options.outlineColor;item.outlineWidth=options.outlineWidth;if(!item.show)item.show=true}};
   feederLabels.removeAll();if(mode!=='planning'){for(const item of planLineByKey.values())item.show=false;for(const item of planningPointByKey.values())item.show=false;for(let gid=0;gid<stationEntities.length;gid++){const gs=cfg.stations[gid],entity=stationEntities[gid];if(entity?.label){entity.label.text=`${gatewayCode(gid)} ${gs.name}`;entity.label.fillColor=Cesium.Color.fromCssColorString('#5fffe0')}}box.style.display='none';return}
   const planning=current?.meta?.planning,plan=viewedPlanningPlan(),run=planning?.active_evaluation;
   if(!planning||!plan||!run){
+    for(const [key,item] of planLineByKey){planLines.remove(item);planLineStyleByKey.delete(key)}
+    planLineByKey.clear();
+    for(const item of planningPointByKey.values())planningPoints.remove(item);
+    planningPointByKey.clear();
     if(box.dataset.ready==='1')return;
     box.innerHTML='<div class="planning-head"><h3>调度摘要</h3></div><div class="planning-details">等待规划结果</div>';
     box.style.display='block';return;
@@ -332,8 +349,9 @@ function renderPlanning(pos){
   const planned=Cesium.Color.fromCssColorString('#28dfff'),scheduled=Cesium.Color.fromCssColorString('#55ff91'),substitute=Cesium.Color.fromCssColorString('#ffb347'),routed=Cesium.Color.fromCssColorString('#b98cff');
   const stationPosition=gs=>Cesium.Cartesian3.fromDegrees(gs.lon,gs.lat,gs.alt||0),byGateway=new Map();
   // 地图推演只呈现站星规划骨架。逐跳路由保留在结果表中，避免与调度连接混在一起。
-  const linkState=new Map((run.link_states||[]).map(row=>[`${row.gateway}:${row.satellite}`,row]));
   const activeLink=new Map();
+  const frameTime=Number(current.meta.time_s);
+  if(frameTime===0)feederHealthByKey.clear();
   for(const row of (run.active_links||[])){
     const key=`${row.gateway}:${row.satellite}`,group=activeLink.get(key)||[];
     group.push(row);activeLink.set(key,group);
@@ -342,17 +360,23 @@ function renderPlanning(pos){
     const key=`${link.gateway}:${link.satellite}`,port=Number(link.feeder_port||1);
     const active=(activeLink.get(key)||[]).filter(row=>Number(row.feeder_port||1)===port);
     const capacity=active.reduce((sum,row)=>sum+Math.max(0,Number(row.rate_gbps||0)),0);
-    if(capacity<=0)return {name:'unavailable',color:'#9aa9b4',spare:0};
+    const stateKey=`${key}:P${port}`;
+    if(capacity<=0){feederHealthByKey.set(stateKey,'unavailable');return {name:'unavailable',color:'#9aa9b4',spare:0}}
     const used=active.reduce((sum,row)=>sum+Math.max(0,Number(row.scheduled_gbps||0)),0);
     const spare=Math.max(0,capacity-used);
-    if(spare<=1e-6)return {name:'full',color:'#ff5b68',spare:0};
-    if(spare<1)return {name:'low',color:'#ffd34d',spare};
-    return {name:'free',color:'#55ff91',spare};
+    const prior=feederHealthByKey.get(stateKey);
+    let name=spare<=1e-6?'full':spare<1?'low':'free';
+    if(prior==='full'&&spare<.05)name='full';
+    else if(prior==='low'&&spare>.95&&spare<1.05)name='low';
+    else if(prior==='free'&&spare>.90)name='free';
+    feederHealthByKey.set(stateKey,name);
+    return {name,color:name==='full'?'#ff5b68':name==='low'?'#ffd34d':'#55ff91',spare};
   };
+  const displayPlanLinks=(plan.links||[]).filter(link=>Number(current.meta.time_s)<Number(link.temporary_until_s??Infinity));
   const health={free:0,low:0,full:0,unavailable:0};
-  for(const link of plan.links)health[marginColor(link).name]++;
+  for(const link of displayPlanLinks)health[marginColor(link).name]++;
   const plannedBySatellite=new Map();
-  for(const link of plan.links){const sid=Number(link.satellite),group=plannedBySatellite.get(sid)||[];group.push(link);plannedBySatellite.set(sid,group)}
+  for(const link of displayPlanLinks){const sid=Number(link.satellite),group=plannedBySatellite.get(sid)||[];group.push(link);plannedBySatellite.set(sid,group)}
   for(const [sid,group] of plannedBySatellite){
     if(group.length<2)continue;
     const sat=pos.get(sid);if(!sat)continue;
@@ -383,10 +407,12 @@ function renderPlanning(pos){
     const positions=[stationPosition(gs),sat];
     const margin=marginColor(link),color=Cesium.Color.fromCssColorString(margin.color);
     const dashed=port===2&&group.length>=2;
-    const material=margin.name==='unavailable'||dashed
+    const styleKey=`${margin.name}:${port}:${sameStation}:${dashed}`;
+    let material=feederMaterialCache.get(styleKey);
+    if(!material){material=margin.name==='unavailable'||dashed
       ?Cesium.Material.fromType('PolylineDash',{color:(sameStation&&dashed&&margin.name!=='unavailable'?Cesium.Color.fromCssColorString('#d7f7ff'):color).withAlpha(.95),dashLength:dashed?10:14})
-      :Cesium.Material.fromType('PolylineGlow',{color:color.withAlpha(.95),glowPower:.12});
-    putLine(`plan-link:${key}`,{positions,width:sameStation?(dashed?2.5:8):(margin.name==='full'?3.2:2.7),material});
+      :Cesium.Material.fromType('PolylineGlow',{color:color.withAlpha(.95),glowPower:.12});feederMaterialCache.set(styleKey,material)}
+    putLine(`plan-link:${key}`,{positions,width:sameStation?(dashed?2.5:8):(margin.name==='full'?3.2:2.7),material,styleKey});
     drawnGroundLinks.add(key);
     if(group.length>=2&&!sameStation){
       const labelPosition=Cesium.Cartesian3.midpoint(positions[0],sat,new Cesium.Cartesian3());
@@ -406,10 +432,12 @@ function renderPlanning(pos){
     putPoint(`prepoint:${row.gateway}:${row.antenna_id}`,{position:sat,pixelSize:34,color:Cesium.Color.TRANSPARENT,
       outlineColor:color,outlineWidth:3,disableDepthTestDistance:Number.POSITIVE_INFINITY});
   }
-  for(const link of [...plan.links].sort((a,b)=>Number(a.feeder_port||1)-Number(b.feeder_port||1))){
+  for(const link of [...displayPlanLinks].sort((a,b)=>Number(a.feeder_port||1)-Number(b.feeder_port||1))){
     const gs=cfg.stations[link.gateway],sat=pos.get(link.satellite);if(!gs||!sat)continue;
-    const linkStatus=linkState.get(`${link.gateway}:${link.satellite}`)?.status;
-    if(linkStatus==='等待切换'||linkStatus==='切星捕获中')continue;
+    const active=(activeLink.get(`${link.gateway}:${link.satellite}`)||[]).some(row=>Number(row.feeder_port||1)===Number(link.feeder_port||1));
+    // A planned target has no radio link while waiting or acquiring. Keep
+    // that state in the detail panel; do not draw a persistent dashed GSL.
+    if(!active)continue;
     drawFeederLink(link,true);
   }
   // During a scheduled handover the old feeder remains active even though it
@@ -457,7 +485,7 @@ function renderPlanning(pos){
   // Merely hiding them caused thousands of stale Cesium primitives to build
   // up during a 30-minute run and progressively slowed both rendering and the
   // simulation worker through CPU/GPU contention.
-  for(const [key,item] of [...planLineByKey])if(!activeLineKeys.has(key)){planLines.remove(item);planLineByKey.delete(key)}
+  for(const [key,item] of [...planLineByKey])if(!activeLineKeys.has(key)){planLines.remove(item);planLineByKey.delete(key);planLineStyleByKey.delete(key)}
   for(const [key,item] of [...planningPointByKey])if(!activePointKeys.has(key)){planningPoints.remove(item);planningPointByKey.delete(key)}
   // 站点实体在场景建立时创建，此处只更新文字和状态，避免每帧销毁重建。
   for(let gid=0;gid<cfg.stations.length;gid++){

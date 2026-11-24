@@ -19,6 +19,19 @@ def link(gateway, satellite, antenna, rate=1.0, switch=0.02):
 
 
 class HandoverTests(unittest.TestCase):
+    def test_idle_east_feeder_can_be_replaced_by_visible_west_successor(self):
+        cfg=PlannerConfig(selection_strategy='slot_tracking',rain_enabled=False,
+            geo_interference_enabled=False,antenna_switch_window_s=10.)
+        planner=SlowFastLoopPlanner([{'lat':0.,'lon':0.,'antenna_count':1,'channel_count':1}],cfg)
+        old={'gateway':0,'satellite':0,'rate_gbps':1.,'azimuth_deg':90.,
+             'pointing_elevation_deg':50.,'gsl_distance_km':600.}
+        new={'gateway':0,'satellite':1,'rate_gbps':1.,'azimuth_deg':270.,
+             'pointing_elevation_deg':50.,'gsl_distance_km':600.,'next_slot_visible':True}
+        previous={'valid_from_s':0.,'valid_until_s':60.,'links':[old],'routes':[]}
+        chosen=planner._retain_slot_links([new],[old,new],previous,
+            [[(1,1000.)],[(0,1000.)]],{0:.5},.5,60.,{(0,0),(0,1)})
+        self.assertEqual([row['satellite'] for row in chosen],[1])
+
     def test_exhausted_feeder_stops_futile_route_searches(self):
         import heapq
         graph=[[] for _ in range(100)]

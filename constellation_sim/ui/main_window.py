@@ -20,7 +20,7 @@ import marshal
 import zlib
 import gc
 from concurrent.futures import ThreadPoolExecutor
-from collections import OrderedDict
+from collections import OrderedDict, deque
 from dataclasses import asdict
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
@@ -778,7 +778,7 @@ class PlanningResultsWidget(QWidget):
                     f"{max(0.,demand-delivered):.3f}",f"{100*min(1.,delivered/demand):.1f}%" if demand else "—",
                     str(region.get("feeder_count",0))])
         if slots:
-            last=slots[-1];end_time=float(last.get("valid_from_s",0))+60.
+            last=slots[-1];end_time=float(last.get("valid_until_s",float(last.get("valid_from_s",0))+60.))
             self.priority_plan_chart.append_values(end_time,
                 max(0.,float(last.get("priority_demand_gbps",0))),
                 max(0.,float(last.get("priority_delivered_gbps",0))))
@@ -1579,7 +1579,8 @@ class SimulationWorker(QObject):
 
     def __init__(self, config: SimulationConfig, result_store=None):
         super().__init__(); self.config = config; self._stop = threading.Event();self.completed_naturally=False
-        self._control_lock = threading.Lock(); self._requested_frame = None
+        self._final_frame_presented=threading.Event()
+        self._control_lock = threading.Lock()
         self._paused = True; self._speed = config.speed;self.result_store=result_store;self._latest_full_frame=None
         self._display_options={"planes":config.planes,"count":config.display_plane_count,"center":config.center_plane,"page":0,"bounds":None,"station_count":len(config.stations)}
         self._planning_strategy_request=(.10,.90)
@@ -1699,7 +1700,7 @@ class SimulationWorker(QObject):
             standby_transfer=(event=="handover" and link.get("handover_from_antenna_id") is not None
                               and prepoint_start is not None and prepoint_ready is not None)
             available_switch_s=(max(0.,float(prepoint_ready)-max(float(prepoint_start),float(previous["time_s"])))
-                                if standby_transfer else planner.config.antenna_switch_window_s)
+                                if standby_transfer else float(link.get("switch_window_s",planner.config.antenna_switch_window_s)))
             if standby_transfer:event="standby_prepoint_handover"
             rows.append({"frame":frame_index,"time_s":sim_time,"gateway":gateway,"antenna_id":antenna,
                 "satellite":satellite,"azimuth_deg":pointing["azimuth_deg"],"elevation_deg":pointing["pointing_elevation_deg"],
@@ -2283,11 +2284,6 @@ class SimulationWorker(QObject):
             next_frame=0;next_due=time.perf_counter();first_frame_submitted=False;gc_was_enabled=gc.isenabled()
             while not self._stop.is_set():
                 with self._control_lock:
-                    requested = self._requested_frame
-                    if requested is not None:
-                        self._requested_frame = None
-                        next_frame = max(0, min(total_frames - 1, requested))
-                        next_due=time.perf_counter()
                     paused = self._paused
                     strategy_request=self._planning_strategy_request
                     self._planning_strategy_request=None
@@ -2353,7 +2349,7 @@ class SimulationWorker(QObject):
                         rain_model=[cfg.rain_enabled,cfg.rain_source],
                         geo_geometry=[cfg.geo_center_longitude_deg,cfg.geo_longitude_spacing_deg,cfg.geo_altitude_km])
                     if planner.config.selection_strategy=="window_margin":offline_spec.update(cache_version=44,algorithm_version=60,objective_formula="weighted_window_mean_capacity_delay_v4",selection_strategy="window_margin",window_sampling="six_points_mean_and_min_rate_v1")
-                    if planner.config.selection_strategy=="slot_tracking":offline_spec.update(cache_version=78,algorithm_version=94,selection_strategy="slot_tracking",slot_seconds=60,transition_route_seconds=5,max_slot_pointing_change_deg=planner.config.max_slot_pointing_change_deg,antenna_steering=[planner.config.antenna_steering_type,planner.config.antenna_az_slew_deg_s,planner.config.antenna_el_slew_deg_s,planner.config.antenna_acquisition_s,planner.config.electronic_switch_ms,planner.config.antenna_switch_window_s,planner.config.electronic_scan_from_zenith_deg,planner.config.antenna_az_accel_deg_s2,planner.config.antenna_el_accel_deg_s2],standby_rf_transfer_s=planner.config.standby_rf_transfer_s,antenna_matching="standby_risk_priority_prepoint_view_v28",regional_landing="bounded_end_to_end_delay_v2",modcod_standard="DVB-S2+S2X_normal_frames")
+                    if planner.config.selection_strategy=="slot_tracking":offline_spec.update(cache_version=89,algorithm_version=105,selection_strategy="slot_tracking",slot_seconds=60,transition_route_seconds=5,max_slot_pointing_change_deg=planner.config.max_slot_pointing_change_deg,antenna_steering=[planner.config.antenna_steering_type,planner.config.antenna_az_slew_deg_s,planner.config.antenna_el_slew_deg_s,planner.config.antenna_acquisition_s,planner.config.electronic_switch_ms,planner.config.antenna_switch_window_s,planner.config.electronic_scan_from_zenith_deg,planner.config.antenna_az_accel_deg_s2,planner.config.antenna_el_accel_deg_s2],standby_rf_transfer_s=planner.config.standby_rf_transfer_s,antenna_matching="optimizer_first_handover_v7",regional_landing="bounded_end_to_end_delay_v2",modcod_standard="DVB-S2+S2X_normal_frames")
                     offline_spec["feeder_link_mode"]=planner.config.feeder_link_mode
                     offline_spec_hash=hashlib.sha256(json.dumps(offline_spec,ensure_ascii=False,sort_keys=True,separators=(",",":")).encode("utf-8")).hexdigest()
                     planning_root=cache_root/"planning";planning_root.mkdir(parents=True,exist_ok=True)
@@ -2427,6 +2423,9 @@ class SimulationWorker(QObject):
                                 end_time=min(slot_time+59,int(cfg.duration_s)-1);end_frame=min(total_frames-1,max(0,round(end_time/cfg.step_s)))
                                 end_gsls,_=compute_gsl_rows(np.asarray(orbit_cache[end_frame])[:,3:6],cfg.stations,cfg.min_elevation_deg,cfg.max_gsl_km)
                                 end_pairs={(int(g),int(s)):float(e) for g,s,e in end_gsls}
+                                next_end_frame=min(total_frames-1,max(0,round(min(slot_time+119,cfg.duration_s-cfg.step_s)/cfg.step_s)))
+                                next_end_gsls,_=compute_gsl_rows(np.asarray(orbit_cache[next_end_frame])[:,3:6],cfg.stations,cfg.min_elevation_deg,cfg.max_gsl_km)
+                                next_slot_visible_pairs={(int(g),int(s)) for g,s,_e in next_end_gsls}
                                 slot_gsls=[[g,s,min(float(e),end_pairs[(int(g),int(s))])]
                                     for g,s,e in slot_gsls if (int(g),int(s)) in end_pairs]
                                 slot_grid,slot_traffic,_=read_traffic_cache_frame(traffic_source,slot_frame)
@@ -2436,10 +2435,10 @@ class SimulationWorker(QObject):
                                     for sid,amount in region_loads.items():slot_priority[sid]=slot_priority.get(sid,0.)+amount
                                 slot_traffic_by_satellite={int(row[0]):float(row[1]) for row in slot_traffic}
                                 slot_priority={sid:min(amount,slot_traffic_by_satellite.get(sid,amount)) for sid,amount in slot_priority.items()}
-                                slot_inputs.append((slot_time,slot_positions,slot_links,slot_gsls,slot_traffic,slot_priority,slot_regions))
+                                slot_inputs.append((slot_time,slot_positions,slot_links,slot_gsls,slot_traffic,slot_priority,slot_regions,next_slot_visible_pairs))
                             for grade,scenario_percentile in grades:
                                 plan_started=time.perf_counter();slot_plans=[];previous_slot_plan=previous_slot_plan_by_grade.get(grade)
-                                for slot_time,slot_positions,slot_links,slot_gsls,slot_traffic,slot_priority,slot_regions in slot_inputs:
+                                for slot_time,slot_positions,slot_links,slot_gsls,slot_traffic,slot_priority,slot_regions,next_slot_visible_pairs in slot_inputs:
                                     if self._stop.is_set():return
                                     # Check the actual one-second axis motion for
                                     # selected links.  Near zenith, a small LOS
@@ -2451,7 +2450,7 @@ class SimulationWorker(QObject):
                                         subplan=planner.generate(slot_time,slot_positions,slot_links,feasible_gsls,slot_traffic,
                                             rain_scenario_percentile=None,rain_grade=grade,commit=False,
                                             priority_traffic=slot_priority,priority_traffic_regions=slot_regions,
-                                            previous_plan=previous_slot_plan)
+                                            previous_plan=previous_slot_plan,next_slot_visible_pairs=next_slot_visible_pairs)
                                         if planner.config.antenna_steering_type!="mechanical":break
                                         invalid=set()
                                         previous_antennas={(int(row["gateway"]),int(row["antenna_id"])):int(row["satellite"])
@@ -2487,6 +2486,30 @@ class SimulationWorker(QObject):
                                         rain_scenario_percentile=None,rain_scenario_kind=("imerg_history_half_hour" if cfg.rain_source=="imerg_csv" else "weather_forecast_hourly") if cfg.rain_source in ("imerg_csv","weather_forecast") else "synthetic_multisite_rate_block30",
                                         visibility_sample_times_s=[slot_time,min(slot_time+59,int(cfg.duration_s)-1)],full_window_visibility_required=False,
                                         tle_asset="base_data/satellites.tles",tle_asset_hash=tle_asset_hash)
+                                    previous_links=(previous_slot_plan or {}).get("links",[])
+                                    if previous_links:
+                                        station_geometry={}
+                                        for gateway in {int(link["gateway"]) for link in previous_links}:
+                                            station=cfg.stations[gateway]
+                                            latitude=math.radians(float(station["lat"]));longitude=math.radians(float(station["lon"]))
+                                            station_geometry[gateway]=(
+                                                np.asarray(geodetic_to_ecef(station["lat"],station["lon"],station.get("alt",0.0))),
+                                                np.asarray((math.cos(latitude)*math.cos(longitude),math.cos(latitude)*math.sin(longitude),math.sin(latitude))))
+                                        visibility_deadlines={f'{int(link["gateway"])}:{int(link["antenna_id"])}':float(slot_time+60)
+                                            for link in previous_links if link.get("antenna_id") is not None}
+                                        for second in range(int(slot_time),min(int(slot_time+60),int(cfg.duration_s))):
+                                            orbit_rows=orbit_cache[min(total_frames-1,max(0,round(second/cfg.step_s)))]
+                                            for link in previous_links:
+                                                antenna=link.get("antenna_id")
+                                                if antenna is None:continue
+                                                gateway=int(link["gateway"]);key=f'{gateway}:{int(antenna)}'
+                                                if visibility_deadlines[key]<slot_time+60:continue
+                                                offset=np.asarray(orbit_rows[int(link["satellite"])][3:6])-station_geometry[gateway][0]
+                                                distance=float(np.linalg.norm(offset))
+                                                elevation=math.degrees(math.asin(max(-1.,min(1.,float(np.dot(offset,station_geometry[gateway][1]))/max(distance,1.)))))
+                                                if elevation+1e-9<cfg.min_elevation_deg or (cfg.max_gsl_km>0 and distance>cfg.max_gsl_km*1000):
+                                                    visibility_deadlines[key]=float(second)
+                                        subplan["old_feeder_visibility_deadline_s"]=visibility_deadlines
                                     planner.prepare_transition_routes(subplan,previous_slot_plan,slot_positions,slot_links,slot_regions)
                                     # Store one-second target pointing for the selected
                                     # antenna only. Include the planned physical slew
@@ -2639,7 +2662,7 @@ class SimulationWorker(QObject):
                     append_diagnostic(diagnostic_path,"offline_planning_completed",plan_count=len(catalog),total_ms=total_planning_ms,average_ms=round(total_planning_ms/max(1,len(catalog)),3),maximum_ms=max((p.get("calculation_ms",0) for p in catalog),default=0))
                     self.offline_planning_ready.emit(catalog);self.progress.emit(100,f"离线规划完成：{len(catalog)}个方案，用时 {total_planning_ms/1000:.1f}s")
                     continue
-                if paused and requested is None:
+                if paused:
                     if gc_was_enabled and not gc.isenabled():gc.enable()
                     next_due=time.perf_counter();self._stop.wait(0.03);continue
                 frame_index = next_frame
@@ -2772,6 +2795,9 @@ class SimulationWorker(QObject):
                       "initial_evaluation_ms":context.get("initial_evaluation_ms",0),
                       "final_evaluation_ms":context.get("final_evaluation_ms",0),
                       "route_search_ms":context.get("route_search_ms",0),
+                      "graph_build_ms":context.get("graph_build_ms",0),
+                      "local_route_search_ms":context.get("local_route_search_ms",0),
+                      "repair_source_count":context.get("repair_source_count",0),
                       "route_rebuild_ms":context.get("route_rebuild_ms",0),
                       "scheduling_event":bool(planning.get("scheduling_event")),"action":planning.get("action",""),
                       "capacity_weight":context.get("capacity_weight"),"delay_weight":context.get("delay_weight"),
@@ -2902,7 +2928,7 @@ class SimulationWorker(QObject):
                     deadline_lag_ms=round((schedule_now-next_due)*1000,1),paused=self._paused)
                 while not self._stop.is_set():
                     with self._control_lock:
-                        if self._requested_frame is not None or self._paused: break
+                        if self._paused: break
                     now=time.perf_counter();remaining=next_due-now
                     if remaining < -interval:
                         next_due=now;remaining=0
@@ -2911,23 +2937,39 @@ class SimulationWorker(QObject):
         except Exception as exc:
             self.failed.emit(f"{type(exc).__name__}: {exc}")
         finally:
+            # The last frame is already in Qt's queue. Waiting releases the
+            # GIL, so map transfer can finish before audit/writer teardown.
+            # A timeout also covers a closed or unresponsive WebEngine page.
+            presentation_wait_started_at=time.perf_counter()
+            if self.completed_naturally:
+                self._final_frame_presented.wait(timeout=2.)
+            presentation_wait_ms=(time.perf_counter()-presentation_wait_started_at)*1000
+            cleanup_started_at=time.perf_counter()
             try:self._flush_frame_pointing_audit()
             except Exception as exc:self.failed.emit(f"天线指向审计保存失败：{type(exc).__name__}: {exc}")
+            audit_cleanup_ms=(time.perf_counter()-cleanup_started_at)*1000
             if "gc_was_enabled" in locals() and gc_was_enabled and not gc.isenabled():
                 gc.enable()
-            gc.collect()
+            # Refcounts release acyclic frame data. A full cyclic collection
+            # here holds the GIL just as Qt receives the final map frame.
+            # Leave cycle collection to the normal interpreter scheduler.
+            executor_cleanup_started_at=time.perf_counter()
             if "executor" in locals():executor.shutdown(wait=True,cancel_futures=True)
+            executor_cleanup_ms=(time.perf_counter()-executor_cleanup_started_at)*1000
             if "traffic_cache_connection" in locals() and traffic_cache_connection is not None:traffic_cache_connection.close()
             # Drain the result writer off the GUI thread.  Closing it from a
             # button/close event can block the Windows message loop.
             if self.result_store is not None:
                 try:self.result_store.close()
                 except Exception as exc:self.failed.emit(f"结果保存失败：{type(exc).__name__}: {exc}")
+            append_diagnostic(locals().get("diagnostic_path", ""),"simulation_worker_cleanup",
+                presentation_wait_ms=round(presentation_wait_ms,1),
+                presentation_completed=self._final_frame_presented.is_set(),
+                audit_ms=round(audit_cleanup_ms,1),executor_ms=round(executor_cleanup_ms,1),
+                total_ms=round((time.perf_counter()-cleanup_started_at)*1000,1))
             self.finished.emit()
 
     def stop(self): self._stop.set()
-    def seek(self, frame_index):
-        with self._control_lock: self._requested_frame = frame_index
     def set_paused(self, paused):
         with self._control_lock: self._paused = paused
     def set_speed(self, speed):
@@ -2943,7 +2985,7 @@ class MainWindow(QMainWindow):
         self.resize(min(1500,max(1,area.width()-32)), min(900,max(1,area.height()-80)))
         icon_path=Path(__file__).with_name("assets")/"satellite.svg"
         if icon_path.exists(): self.setWindowIcon(QIcon(str(icon_path)))
-        self.thread = self.worker = None; self.web_ready = False; self.pending_frame = None; self.transfer_queue = [];self.transfer_in_flight=False
+        self.thread = self.worker = None; self.web_ready = False; self.pending_frame = None; self.live_render_queue = deque(maxlen=1); self.transfer_queue = [];self.transfer_in_flight=False;self._thread_cleanup_pending=False
         self.last_transfer_page = None; self.last_sent_isls = {}
 
         self._frame_progress_queue=[];self._frame_progress_last_at=0.0;self._frame_progress_timer_pending=False
@@ -3420,7 +3462,7 @@ class MainWindow(QMainWindow):
         self.walker_layout=QComboBox(); self.walker_layout.addItems(["Walker Delta（RAAN 360°）", "Walker Star（RAAN 180°，自动启用轨道缝隙）"])
         self.duration=self._spin(600,600,600,0," s"); self.duration.setToolTip("当前离线规划固定覆盖10分钟，共2个五分钟周期。")
         self.step=self._spin(0.1,3600,1,2," s"); self.step.setToolTip("仿真输出的时间步长；步长越小，帧数和计算耗时越多。")
-        self.speed=QComboBox(); self.speed.addItems(["1×","2×","5×"]); self.speed.setCurrentText("1×"); self.speed.setFixedWidth(72);self.speed.setToolTip("结果播放速度，不改变轨道、规划或链路计算结果。")
+        self.speed=QComboBox(); self.speed.addItems(["1×","2×"]); self.speed.setCurrentText("1×"); self.speed.setFixedWidth(72);self.speed.setToolTip("边计算边显示；倍速只调整帧间隔，不跳过仿真帧。")
         self.satellite_antennas=self._spin(1,32,4);self.satellite_channels=self._spin(1,128,4);self.satellite_channel_capacity=self._spin(0.1,1000,10,1," Gb/s");self.geo_interference=QCheckBox("纳入同频GEO/GSO干扰");self.geo_interference.setChecked(True)
         self.geo_satellite_count=self._spin(1,12,3);self.geo_center_longitude=self._spin(-180,180,110,1,"°E");self.geo_longitude_spacing=self._spin(1,60,30,1,"°");self.geo_altitude=self._spin(35000,37000,35786,0," km");self.gso_i_over_n=self._spin(-30,0,-12,1," dB");self.gso_protection_angle=self._spin(0,30,10,1,"°")
         self.isl_pattern=QComboBox(); self.isl_pattern.addItems(["4-ISL规则网格", "3-ISL固定砖墙"])
@@ -4432,7 +4474,7 @@ class MainWindow(QMainWindow):
         self.active_config=cfg; self.prepared_ready=False; self.prepared_metadata=None; self.summary_history.clear(); self.planning_results.clear();self.planning_resources.clear();self.planning_evaluation.clear();self._populate_planning_choices([]); self._refresh_parameter_actions(); self.preparation_started_at=time.perf_counter();self.run_started_at=None;self.run_elapsed_s=0.0;self.elapsed_phase="preparation";self.elapsed_label.setText("准备耗时 00:00:00");self.cache_status_label.setText("缓存检查中");self.cache_status_label.setToolTip("正在检查各模型缓存");self.cache_status_label.setStyleSheet("QLabel{color:#ff6675;background:#35131b;border:1px solid #ff3b4f;border-radius:3px;padding:3px 8px;font-weight:700}"); self.state_badge.setText("● 准备中"); self.alert_label.setText("告警 0"); self._set_scenario_editable(False);self.busy_overlay.start("正在检查并生成场景基础数据…")
         self._set_property_drawer(False)
         self.user_stopping = False; self.prepared_ready = False
-        self.latest_full_frame = None; self.current_full_frame = None; self.scenario_planes = None; self.pending_frame = None
+        self.latest_full_frame = None; self.current_full_frame = None; self.scenario_planes = None; self.pending_frame = None; self.live_render_queue.clear()
         self.last_transfer_page = None; self.last_sent_isls = {}
 
         self._frame_progress_queue.clear();self._frame_progress_last_at=0.0;self._frame_progress_timer_pending=False
@@ -4530,6 +4572,9 @@ class MainWindow(QMainWindow):
         if emitted_perf is not None and self.active_config:
             append_diagnostic(str(Path(self.active_config.result_directory)/"time_variation.jsonl") if self.active_config.result_directory else "","frame_received",frame=data["index"],qt_queue_ms=round((time.perf_counter()-emitted_perf)*1000,1),pending_render_replaced=self.pending_frame is not None,transfer_in_flight=self.transfer_in_flight)
         if data.get("_display_hidden"):
+            if (self.worker is not None and
+                    int(data.get("index",-1))==int(data.get("total",0))-1):
+                self.worker._final_frame_presented.set()
             summary=data.get("summary")
             if summary is not None:self.summary_history[data["index"]]=summary
             return
@@ -4543,15 +4588,11 @@ class MainWindow(QMainWindow):
             if data["index"]!=self.seeking_index:return
             self.seeking_index=None;self.follow_live=True;self._show_full_frame(data);return
         if not self.follow_live:
+            if (self.worker is not None and
+                    int(data.get("index",-1))==int(data.get("total",0))-1):
+                self.worker._final_frame_presented.set()
             return
-        speed=float(self.speed.currentText().replace("×",""));now=time.perf_counter();is_final=int(data.get("index",-1))==int(data.get("total",0))-1
-        # At 1x, a late five-second dispatch can make the next frame arrive
-        # less than 0.5 s later. Dropping that frame creates a visible two-second
-        # jump even though Cesium can normally transfer it in about 0.2 s.
-        # Keep throttling only when the user explicitly runs faster than 1x.
-        display_interval=0.0 if speed<=1 else (0.35 if speed<5 else 0.50)
-        if not is_final and display_interval and now-self.last_display_at<display_interval:return
-        self.last_display_at=now
+        # Keep only the newest waiting map frame. The model still computes every step.
         self.frame_cache[data["index"]]=data;self.frame_cache.move_to_end(data["index"])
         while len(self.frame_cache)>self.frame_cache_limit:self.frame_cache.popitem(last=False)
         self._show_full_frame(data)
@@ -4604,7 +4645,9 @@ class MainWindow(QMainWindow):
         if display_filtered:
             data.pop("_display_filtered",None);filter_ms=data.pop("_render_filter_ms",0)
             append_diagnostic(str(Path(self.active_config.result_directory)/"time_variation.jsonl") if self.active_config and self.active_config.result_directory else "","frame_filtered",frame=data.get("index",-1),page=self._filter_options()["page"],filter_ms=filter_ms,filter_queue_ms=0,rows={name:len(data.get(name,[])) for name in ("satellites","isls","seams","gsls","traffic","satellite_traffic")})
-            self.pending_frame=data
+            if self.worker is not None and not self.is_paused and self.follow_live:
+                self.live_render_queue.append(data)
+            else:self.pending_frame=data
             if not self.transfer_queue and not self.transfer_in_flight:self._start_transfer()
             return
         self.current_full_frame = data
@@ -4619,7 +4662,10 @@ class MainWindow(QMainWindow):
         # Table and chart pages do not need a hidden Cesium frame. Returning to
         # either map page requests the latest full frame through the worker.
         if hasattr(self,"planning_tabs") and self.planning_tabs.currentIndex() in (1,2,3):
-            self.pending_frame=None;self.transfer_queue.clear();self.transfer_progress.setValue(0);return
+            if (self.worker is not None and
+                    int(data.get("index",-1))==int(data.get("total",0))-1):
+                self.worker._final_frame_presented.set()
+            self.pending_frame=None;self.live_render_queue.clear();self.transfer_queue.clear();self.transfer_progress.setValue(0);return
         if data.pop("_display_filtered",False):
             filter_ms=data.pop("_render_filter_ms",0)
             append_diagnostic(str(Path(self.active_config.result_directory)/"time_variation.jsonl") if self.active_config and self.active_config.result_directory else "","frame_filtered",frame=data.get("index",-1),page=self._filter_options()["page"],filter_ms=filter_ms,filter_queue_ms=0,rows={name:len(data.get(name,[])) for name in ("satellites","isls","seams","gsls","traffic","satellite_traffic")})
@@ -4629,11 +4675,11 @@ class MainWindow(QMainWindow):
     def _timeline_pressed(self):
         self.timeline_dragging=True;self.follow_live=False;self.seeking_index=None
         self.timeline_resume_after_drag=self.result_playing if self.loaded_result else bool(self.worker is not None and not self.is_paused)
-        self.pending_frame=None;self.transfer_queue.clear();self.transfer_progress.setValue(0)
+        self.pending_frame=None;self.live_render_queue.clear();self.transfer_queue.clear();self.transfer_progress.setValue(0)
         if self.loaded_result and self.result_playing:self._toggle_result_playback()
         elif self.worker is not None and not self.is_paused:self._toggle_pause()
         if self.web_ready:self.web.page().runJavaScript("setTimelineDragging(true)")
-        self.status.setText("拖动时间轴：仅预览时刻，松开后定位并恢复原播放状态")
+        self.status.setText("拖动时间轴：预览已计算帧，仿真计算仍按时间顺序进行")
     def _timeline_released(self):
         self.timeline_dragging=False
         if self.web_ready:self.web.page().runJavaScript("setTimelineDragging(false)")
@@ -4646,12 +4692,20 @@ class MainWindow(QMainWindow):
                 self._load_result_frame(index)
                 if resume and not self.result_playing:self._toggle_result_playback()
             QTimer.singleShot(0,load_and_resume);return
-        frame = self.frame_cache.get(index)
+        # A running planner is stateful. Jumping its calculation index leaves
+        # handovers and route assignments from the previous simulation time.
+        # The live timeline therefore previews completed cached frames only.
+        resume_live=self.timeline_resume_after_drag
+        frame=self.frame_cache.get(index)
+        if frame is None and self.worker is not None:
+            frame=self.worker.latest_full_frame()
         if frame is not None:
-            self.follow_live=True;self._show_full_frame(frame);self.status.setText(f"已定位到 t={frame['time_s']:g} s")
-            if self.worker is not None:self.seeking_index=index;self.worker.seek(index)
-        elif self.worker is not None:
-            self.seeking_index=index;self.worker.seek(index);self.status.setText(f"正在定位到 t={index*self.step.value():g} s…")
+            self.follow_live=resume_live
+            self.seeking_index=None
+            self._show_full_frame(frame)
+            self.timeline.setValue(int(frame["index"]))
+            self.status.setText("已预览已计算帧；仿真计算仍按时间顺序继续" if resume_live else
+                                "已预览已计算帧；继续仿真将返回实时画面")
         if self.timeline_resume_after_drag and self.worker is not None:
             self.is_paused=False;self.run_started_at=time.perf_counter();self.elapsed_phase="simulation";self.worker.set_paused(False);self.start_btn.setText("仿真运行中");self.start_btn.setEnabled(False);self.prepare_btn.setEnabled(False);self.state_badge.setText("● 运行中")
         self.timeline_resume_after_drag=False
@@ -4672,7 +4726,10 @@ class MainWindow(QMainWindow):
             return
         if self.is_paused:
             restarting=self._simulation_at_end()
-            if restarting:self.worker.seek(0)
+            if restarting:
+                self.status.setText("本次仿真已结束；重新仿真需重新生成基础数据")
+                return
+            self.follow_live=True;self.seeking_index=None
             self.is_paused=False
             if restarting or self.current_full_frame is None or self.timeline.value()==0:
                 self.run_elapsed_s=0.0;self.elapsed_phase="simulation";self.elapsed_label.setText("仿真耗时 00:00:00")
@@ -4739,7 +4796,7 @@ class MainWindow(QMainWindow):
     def _filtered_frame_ready(self,frame,generation):
         if self._closing or generation!=self.render_filter_generation:return
         append_diagnostic(str(Path(self.active_config.result_directory)/"time_variation.jsonl") if self.active_config and self.active_config.result_directory else "","frame_filtered",frame=frame.get("index",-1),page=self._filter_options()["page"],filter_ms=frame.pop("_render_filter_ms",0),filter_queue_ms=frame.pop("_render_filter_queue_ms",0),rows={name:len(frame.get(name,[])) for name in ("satellites","isls","seams","gsls","traffic","satellite_traffic")})
-        self.pending_frame=frame
+        self.live_render_queue.clear();self.pending_frame=frame
         if not self.transfer_queue and not self.transfer_in_flight:self._start_transfer()
 
     @staticmethod
@@ -5120,9 +5177,13 @@ class MainWindow(QMainWindow):
                 "traffic":True,"serviceAreas":True,"trafficRegions":True,"trafficCoverage":False,
                 "trafficLinks":True,"seam":True,"latitude":True}
     def _start_transfer(self):
-        if self.pending_frame is None:return
-        frame=self.pending_frame; self.pending_frame=None
+        if self.live_render_queue:
+            frame=self.live_render_queue.popleft()
+        elif self.pending_frame is not None:
+            frame=self.pending_frame;self.pending_frame=None
+        else:return
         self.transfer_frame_index=frame.get("index",-1);self.transfer_started_at=time.perf_counter()
+        self.transfer_is_final_frame=(self.transfer_frame_index==int(frame.get("total",0))-1)
         self.transfer_frame_time=frame.get("time_s",0);self.transfer_absolute_time=frame.get("absolute_time","--")
         page=int(frame.get("display_page",0)); current_isls={self._isl_transfer_key(row):row for row in frame.get("isls",[])}
         use_isl_delta=page==0 and self.last_transfer_page==0
@@ -5166,10 +5227,22 @@ class MainWindow(QMainWindow):
     def _send_next(self):
         if self.transfer_in_flight:return
         if not self.transfer_queue:
-            if self.pending_frame is not None:self._start_transfer()
+            if self.live_render_queue or self.pending_frame is not None:self._start_transfer()
             return
         command=self.transfer_queue.pop(0)
-        done=self.transfer_progress.maximum()-len(self.transfer_queue);self.transfer_in_flight=True;self.web.page().runJavaScript(command,lambda result:self._transfer_done(done,result))
+        done=self.transfer_progress.maximum()-len(self.transfer_queue)
+        kind=("finish" if command.startswith("JSON.stringify(finishFrame") else
+              "begin" if command.startswith("beginFrame") else
+              command.split("'",2)[1] if command.startswith("appendFrameData('") else "other")
+        command_started_at=time.perf_counter()
+        # Return the JS execution time separately from the Qt/WebEngine
+        # callback latency. The latter includes IPC and event-loop waiting.
+        timed_command=("(()=>{const __start=performance.now();"
+            f"const __value=({command});"
+            "return JSON.stringify({js_ms:performance.now()-__start,value:__value});})()")
+        self.transfer_in_flight=True
+        self.web.page().runJavaScript(timed_command,
+            lambda result:self._transfer_done(done,result,kind,command_started_at))
     def _update_absolute_time_display(self,*_args):
         raw=getattr(self,"transfer_absolute_time",None)
         if not raw or raw=="--" or not self.active_config:
@@ -5184,7 +5257,21 @@ class MainWindow(QMainWindow):
         except ValueError:
             self.absolute_time_label.setText(str(raw))
 
-    def _transfer_done(self,value,result=None):
+    def _transfer_done(self,value,result=None,kind="other",command_started_at=None):
+        callback_ms=((time.perf_counter()-command_started_at)*1000
+                     if command_started_at is not None else 0.)
+        try:
+            envelope=json.loads(result) if isinstance(result,str) else {}
+            js_ms=float(envelope.get("js_ms",0.))
+            result=envelope.get("value")
+        except (ValueError,TypeError,AttributeError):
+            js_ms=0.
+        if self.active_config and (callback_ms>=100. or getattr(self,"transfer_is_final_frame",False)):
+            append_diagnostic(str(Path(self.active_config.result_directory)/"time_variation.jsonl") if self.active_config.result_directory else "",
+                "frame_transfer_command",frame=getattr(self,"transfer_frame_index",-1),
+                command_index=value,command_kind=kind,
+                callback_ms=round(callback_ms,1),js_ms=round(js_ms,1),
+                callback_wait_ms=round(max(0.,callback_ms-js_ms),1))
         self.transfer_in_flight=False;self.transfer_progress.setValue(value)
         if not self.transfer_queue and self.active_config:
             if not self.timeline_dragging:
@@ -5195,7 +5282,12 @@ class MainWindow(QMainWindow):
             except (ValueError, TypeError):
                 render_metrics={}
             append_diagnostic(str(Path(self.active_config.result_directory)/"time_variation.jsonl") if self.active_config.result_directory else "","frame_render_transfer_finished",frame=getattr(self,"transfer_frame_index",-1),transfer_ms=round((time.perf_counter()-getattr(self,"transfer_started_at",time.perf_counter()))*1000,1),js_render_ms=render_metrics.get("render_ms"),js_regions_ms=render_metrics.get("regions_ms"),js_traffic_panel_ms=render_metrics.get("traffic_panel_ms"),js_planning_ms=render_metrics.get("planning_ms"),rows=getattr(self,"transfer_row_counts",{}),replacement_waiting=self.pending_frame is not None)
+            if self.worker is not None and getattr(self,"transfer_is_final_frame",False):
+                self.worker._final_frame_presented.set()
         QTimer.singleShot(0,self._send_next)
+        if self._thread_cleanup_pending and not self.transfer_in_flight and not self.transfer_queue:
+            self._thread_cleanup_pending=False
+            QTimer.singleShot(0,self._thread_stopped)
 
     def _save_simulation_data(self):
         tables=(
@@ -5425,6 +5517,7 @@ class MainWindow(QMainWindow):
             QMessageBox.critical(self,"导出失败",str(exc))
     @Slot(int,str)
     def _progress(self,value,text):
+        progress_started_at=time.perf_counter()
         if self.user_stopping:return
         if (self.elapsed_phase=="simulation" and self.speed.currentIndex()==0
                 and str(text).startswith("第 ") and self.worker is not None):
@@ -5439,6 +5532,10 @@ class MainWindow(QMainWindow):
             self.busy_overlay.set_progress(value,text)
         if "业务缓存" in text:self.cache_status_label.setText("业务缓存生成中")
         elif "轨道缓存" in text:self.cache_status_label.setText("轨道缓存生成中")
+        progress_ms=(time.perf_counter()-progress_started_at)*1000
+        if progress_ms>=100. and self.active_config:
+            append_diagnostic(str(Path(self.active_config.result_directory)/"time_variation.jsonl") if self.active_config.result_directory else "",
+                "simulation_progress_ui_slow",elapsed_ms=round(progress_ms,1),value=value)
     def _show_next_frame_progress(self):
         if not self._frame_progress_queue or self._frame_progress_timer_pending:return
         remaining=0.85-(time.perf_counter()-self._frame_progress_last_at)
@@ -5464,13 +5561,26 @@ class MainWindow(QMainWindow):
         QMessageBox.critical(self,"仿真失败",text); self.status.setText(text); self.state_badge.setText("● 错误"); self.alert_label.setText("告警 1")
     @Slot()
     def _finished(self):
+        finished_started_at=time.perf_counter()
         if self.user_stopping:return
         self._frame_progress_queue.clear()
         self.busy_overlay.stop()
         self._reset_one_click_run()
         if self.run_started_at is not None:self.run_elapsed_s+=max(0.0,time.perf_counter()-self.run_started_at);self.run_started_at=None
         self.start_btn.setText("开始仿真"); self.start_btn.setEnabled(False); self.stop_btn.setEnabled(False); self.status.setText(self.status.text()+"；仿真结束"); self.state_badge.setText("● 已结束")
+        if self.active_config:
+            append_diagnostic(str(Path(self.active_config.result_directory)/"time_variation.jsonl") if self.active_config.result_directory else "",
+                "simulation_finished_ui",elapsed_ms=round((time.perf_counter()-finished_started_at)*1000,1))
     def _thread_stopped(self):
+        if (self.worker is not None and self.worker.completed_naturally and
+                self.transfer_in_flight and getattr(self,"transfer_is_final_frame",False)):
+            # The completion signal can arrive while the final Cesium frame
+            # is in flight. Keep GUI teardown off that frame's callback path.
+            self._thread_cleanup_pending=True
+            if self.active_config:
+                append_diagnostic(str(Path(self.active_config.result_directory)/"time_variation.jsonl") if self.active_config.result_directory else "",
+                    "simulation_cleanup_deferred",frame=getattr(self,"transfer_frame_index",-1))
+            return
         if self._closing:
             self.worker=None;self.thread=None
             QTimer.singleShot(0,self.close)
@@ -5500,7 +5610,7 @@ class MainWindow(QMainWindow):
         if self.user_stopping:
             saved_path=self.result_store_path
             if self.result_store:self.result_store.close(); self.result_store=None
-            self.frame_cache.clear(); self.latest_full_frame = None; self.current_full_frame = None; self.pending_frame = None
+            self.frame_cache.clear(); self.latest_full_frame = None; self.current_full_frame = None; self.pending_frame = None; self.live_render_queue.clear()
             self.summary_history.clear(); self.active_config = None; self.prepared_metadata = None
             self.planning_results.clear();self.planning_resources.clear();self.planning_evaluation.clear()
             self.result_store_path=None;self.scenario_planes=None;self.offline_planning_started_at=None
